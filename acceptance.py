@@ -157,6 +157,16 @@ GROUPS: list[Group] = [
         title="規格對齊",
         purpose="確認與 Claude Code 的 skill 規格一致：命名規則、description 上限、allowed-tools。",
         items=[
+            Item("description 彼此分得開", "test_indistinguishable_descriptions_are_flagged",
+                 "選錯 skill 是最常見的失敗模式，且上線後難以歸因——模型不會說它在猶豫。"
+                 "單看每個 description 都合格，擺在一起才看得出問題。",
+                 "跑 spec.validate --level=L2，依 LINT-040 的指示改寫 description。"),
+            Item("寫得好的 description 不被誤報", "test_distinct_descriptions_pass_cleanly",
+                 "誤報比漏報更傷（RFC-175），會訓練使用者忽略輸出。",
+                 "檢查 DESCRIPTION_SIMILARITY_LIMIT 是否過低。"),
+            Item("相似度門檻落在兩個分佈之間", "test_similarity_threshold_separates_the_two_populations",
+                 "門檻若落在分佈內，不是好的被標記就是差的被放行。",
+                 "重新校準 spec/validate.py 的 DESCRIPTION_SIMILARITY_LIMIT。"),
             Item("skill 名稱符合 Claude Code 規則", "test_skill_name_follows_claude_code_rules",
                  "小寫字母、數字、連字號，最多 64 字元。同時擋掉會讓 state 目錄逃逸的名稱。",
                  "把 SKILL.md 的 name 改成 kebab-case，例如 order-lookup。"),

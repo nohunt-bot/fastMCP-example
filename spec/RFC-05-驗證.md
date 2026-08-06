@@ -85,6 +85,34 @@ uv run python -m spec.validate <路徑> [--recursive] [--format=json] [--level=L
 | LINT-020 | warning | shell script 未設定 set -e | ✓ |
 | LINT-021 | warning | pipefail 搭配 \| head | ✓ |
 | LINT-030 | info | 規則已被豁免（附理由） | — |
+| LINT-040 | warning | description 與其他 skill 過於相似 | ✗ |
+
+### LINT-040 是唯一需要全域視角的規則
+
+其他規則都能單獨看一個 Bundle 判斷。可區分性不行——單看任何一個
+`description` 永遠合格，問題只在它跟別的擺在一起時才出現，而**模型看到的
+正是擺在一起的樣子**。
+
+門檻：CJK bigram + 英文詞的 Jaccard 相似度 ≥ **0.35**。
+
+校準自對照實驗：
+
+| description 寫法 | 相似度範圍 |
+|---|---|
+| 照直覺寫（「查詢訂單狀態。提供訂單狀態的查詢功能。」） | 0.43 – 0.57 |
+| 「做什麼 + 何時使用 + 使用者口語」 | 0.11 – 0.14 |
+
+兩個分佈完全不重疊，0.35 取在中間偏保守處。切詞方式與服務端的檢索一致，
+因此量到的就是模型實際會遇到的混淆程度。
+
+少於 4 個 token 的 description 跳過比較，避免誤報。
+
+**RFC-035a** 同一個 Skill Root 內，任兩個 `description` 的相似度
+SHOULD NOT 達到 0.35。
+
+**理由**：選錯 Skill 是本系統最常見的失敗模式，且上線後難以歸因——模型
+不會回報「我在兩個之間猶豫」，它只會選一個然後給出錯誤的答案。這個問題
+在撰寫當下可被偵測，不必等到營運階段。
 
 ## 10.5 豁免機制
 

@@ -60,6 +60,39 @@ DANGEROUS_ENV = {
 DANGEROUS_ENV_PREFIXES = ("LD_", "DYLD_")
 
 
+# ---------------------------------------------------------------- 可區分性
+
+#: description 之間的 Jaccard 相似度門檻。
+#:
+#: 校準自對照實驗：照直覺寫的 description（「查詢訂單資料。提供訂單的查詢
+#: 功能。」這類）彼此相似度落在 0.43–0.57；改寫成「做什麼 + 何時使用 +
+#: 使用者口語」之後落在 0.11–0.14。兩個分佈之間有很大的空隙，0.35 取在
+#: 中間偏保守的位置。
+DESCRIPTION_SIMILARITY_LIMIT = 0.35
+#: 低於這個 token 數的 description 無法可靠比較，跳過以免誤報。
+MIN_TOKENS_FOR_SIMILARITY = 4
+
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿぀-ヿ가-힯]+")
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _describe_tokens(text: str) -> set[str]:
+    """CJK bigram + 英文詞。與服務端的檢索切詞一致，因此這裡量到的
+    相似度就是模型實際會遇到的混淆程度。"""
+    tokens: list[str] = []
+    lowered = text.lower()
+    for match in _CJK_RE.finditer(lowered):
+        run = match.group()
+        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+    tokens.extend(_WORD_RE.findall(_CJK_RE.sub(" ", lowered)))
+    return set(tokens)
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
 @dataclass
 class Finding:
     rule: str
@@ -469,23 +502,65 @@ def check_body(body: str, directory: Path, report: Report) -> None:
 
 # ----------------------------------------------------------------- 進入點
 
-def validate_skill(directory: Path, report: Report) -> None:
+def check_distinguishability(
+    manifests: list[tuple[Path, str, str]], report: Report
+) -> None:
+    """跨 skill 檢查：description 之間必須夠不一樣。
+
+    這是唯一需要全域視角的規則——單看一個 description 永遠合格，問題只在
+    它跟別的擺在一起時才出現。而模型看到的正是「擺在一起」的樣子。
+
+    選錯 skill 是 skill 系統最常見的失敗模式，且上線後很難歸因：模型不會
+    說「我在兩個之間猶豫」，它只會選一個然後給出錯的答案。
+    """
+    entries = [
+        (path, name, desc, _describe_tokens(desc))
+        for path, name, desc in manifests
+        if len(_describe_tokens(desc)) >= MIN_TOKENS_FOR_SIMILARITY
+    ]
+    for i, (path_a, name_a, _desc_a, tokens_a) in enumerate(entries):
+        worst: tuple[float, str] | None = None
+        for _path_b, name_b, _desc_b, tokens_b in entries[i + 1 :]:
+            score = _jaccard(tokens_a, tokens_b)
+            if score >= DESCRIPTION_SIMILARITY_LIMIT and (worst is None or score > worst[0]):
+                worst = (score, name_b)
+        if worst is not None:
+            score, name_b = worst
+            report.add(
+                rule="LINT-040", severity="warning", path=str(path_a),
+                message=f"description 與 {name_b!r} 相似度 {score:.0%}，"
+                        "模型可能選錯（門檻 35%）",
+                rfc="RFC-035",
+                remediation="加入「何時使用」與使用者實際會說的話，"
+                            "而不是只描述功能。例：把「查詢訂單狀態」改成"
+                            "「依訂單編號查出貨進度。當使用者問『我的東西寄到哪』時使用」",
+            )
+
+
+def validate_skill(directory: Path, report: Report) -> tuple[Path, str, str] | None:
+    """驗證單一 skill。回傳 (路徑, name, description) 供跨 skill 檢查。"""
     skill_md = directory / "SKILL.md"
     if not skill_md.is_file():
         report.add(rule="VAL-001", severity="error", path=str(directory),
                    message="缺少 SKILL.md", rfc="RFC-021")
-        return
+        return None
 
     manifest, body, findings = parse_frontmatter(skill_md)
     report.findings.extend(findings)
     if not manifest:
-        return
+        return None
 
     scripts = check_filesystem(directory, report)
     check_manifest(manifest, directory, report)
     check_execution(manifest, directory, scripts, report)
     check_scripts(directory, scripts, report)
     check_body(body, directory, report)
+
+    name = manifest.get("name", directory.name)
+    description = manifest.get("description")
+    if isinstance(name, str) and isinstance(description, str) and description.strip():
+        return skill_md, name, description
+    return None
 
 
 def discover(root: Path, recursive: bool) -> list[Path]:
@@ -546,8 +621,12 @@ def main(argv: list[str] | None = None) -> int:
     if not targets:
         report.add(rule="VAL-000", severity="error", path=str(args.target),
                    message="找不到任何 SKILL.md", rfc="RFC-020")
+    manifests: list[tuple[Path, str, str]] = []
     for skill_dir in targets:
-        validate_skill(skill_dir, report)
+        entry = validate_skill(skill_dir, report)
+        if entry is not None:
+            manifests.append(entry)
+    check_distinguishability(manifests, report)
 
     if args.format == "json":
         print(json.dumps(report.to_dict(args.level), ensure_ascii=False, indent=2))

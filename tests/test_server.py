@@ -2139,3 +2139,94 @@ async def test_caller_cannot_hijack_the_shared_library_via_skill_root(tmp_path: 
         await runner.run(
             "invoice-issue", "scripts/run.sh", env={"SKILL_ROOT": str(evil)}, timeout=30
         )
+
+
+# ==================== description 可區分性（LINT-040）=======================
+
+
+def _write_skills(root: Path, pairs: list[tuple[str, str]]) -> Path:
+    for name, desc in pairs:
+        skill = root / name
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\n內文\n"
+        )
+    return root
+
+
+VAGUE = [
+    ("order-query", "查詢訂單資料。提供訂單的查詢功能。"),
+    ("order-detail", "查詢訂單明細。提供訂單明細的查詢功能。"),
+    ("order-status", "查詢訂單狀態。提供訂單狀態的查詢功能。"),
+    ("refund-query", "查詢退款資料。提供退款的查詢功能。"),
+    ("refund-status", "查詢退款狀態。提供退款狀態的查詢功能。"),
+]
+DISTINCT = [
+    ("order-lookup", "依訂單編號查出貨進度與物流單號。當使用者問「我的東西寄到哪」或提供訂單編號時使用。"),
+    ("order-items", "列出訂單內的商品明細與單價金額。當使用者問「我買了什麼」「總共多少錢」時使用。"),
+    ("refund-apply", "建立退款申請並回傳受理編號。當使用者說「我要退貨」「要退錢」時使用。"),
+    ("refund-progress", "查詢已申請退款的處理進度與預計入帳日。當使用者問「錢什麼時候退」時使用。"),
+    ("invoice-issue", "開立電子發票或折讓單。當使用者要發票、報帳或改開統編時使用。"),
+]
+
+
+def test_indistinguishable_descriptions_are_flagged(tmp_path: Path):
+    """單看每個 description 都合格，擺在一起才看得出問題。
+
+    這是唯一需要全域視角的規則。選錯 skill 是最常見的失敗模式，而且上線後
+    難以歸因——模型不會說「我在兩個之間猶豫」，它只會選一個然後答錯。
+    """
+    report = _run_validator(str(_write_skills(tmp_path, VAGUE)))
+    flagged = [f for f in report["findings"] if f["rule"] == "LINT-040"]
+    assert flagged, "五個幾乎一樣的 description 應該被標記"
+    assert all(f["severity"] == "warning" for f in flagged)
+    assert "相似度" in flagged[0]["message"]
+    assert "何時使用" in flagged[0]["remediation"], "要指出怎麼改，不只說有問題"
+
+
+def test_distinct_descriptions_pass_cleanly(tmp_path: Path):
+    """誤報比漏報更傷（RFC-175）：寫得好的 description 不能被標記。"""
+    report = _run_validator(str(_write_skills(tmp_path, DISTINCT)), ["--level=L2"])
+    assert not [f for f in report["findings"] if f["rule"] == "LINT-040"]
+    assert report["passed"] is True
+
+
+def test_similarity_threshold_separates_the_two_populations():
+    """門檻必須落在兩個分佈之間，否則不是好標記就是好放行。
+
+    校準資料：照直覺寫的相似度 0.43–0.57，改寫後 0.11–0.14。
+    """
+    from spec.validate import (
+        DESCRIPTION_SIMILARITY_LIMIT,
+        _describe_tokens,
+        _jaccard,
+    )
+
+    def pairs(skills):
+        return [
+            _jaccard(_describe_tokens(a[1]), _describe_tokens(b[1]))
+            for i, a in enumerate(skills)
+            for b in skills[i + 1 :]
+        ]
+
+    vague, distinct = pairs(VAGUE), pairs(DISTINCT)
+    assert max(distinct) < DESCRIPTION_SIMILARITY_LIMIT < max(vague), (
+        f"門檻 {DESCRIPTION_SIMILARITY_LIMIT} 沒有落在兩個分佈之間："
+        f"好的最高 {max(distinct):.2f}，差的最高 {max(vague):.2f}"
+    )
+
+
+def test_short_descriptions_are_skipped_not_falsely_flagged(tmp_path: Path):
+    """token 太少無法可靠比較，跳過而不是誤報。"""
+    report = _run_validator(str(_write_skills(tmp_path, [
+        ("a-one", "查訂單"), ("a-two", "查庫存"),
+    ])))
+    assert not [f for f in report["findings"] if f["rule"] == "LINT-040"]
+
+
+def test_single_skill_never_triggers_similarity(tmp_path: Path):
+    """只有一個 skill 時沒有比較對象。"""
+    report = _run_validator(str(_write_skills(tmp_path, [
+        ("solo-skill", "查詢訂單資料。提供訂單的查詢功能與明細列表。"),
+    ])))
+    assert not [f for f in report["findings"] if f["rule"] == "LINT-040"]
