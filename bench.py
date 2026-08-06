@@ -92,6 +92,7 @@ async def run_scenario(
         "rps": round(len(latencies) / elapsed, 1) if elapsed else 0.0,
         "mean_ms": round(statistics.fmean(ordered), 3) if ordered else 0.0,
         "p50_ms": round(_percentile(ordered, 0.50), 3),
+        "p75_ms": round(_percentile(ordered, 0.75), 3),
         "p95_ms": round(_percentile(ordered, 0.95), 3),
         "p99_ms": round(_percentile(ordered, 0.99), 3),
     }
@@ -100,14 +101,16 @@ async def run_scenario(
 async def main_async(args: argparse.Namespace) -> None:
     names = args.scenario or list(SCENARIOS)
     print(f"target={args.url}  concurrency={args.concurrency}  iterations={args.iterations}\n")
-    header = f"{'scenario':<10}{'calls':>8}{'err':>5}{'rps':>12}{'p50 ms':>10}{'p95 ms':>10}{'p99 ms':>10}"
+    header = (f"{'scenario':<10}{'calls':>7}{'err':>5}{'rps':>10}"
+              f"{'p50 ms':>10}{'p75 ms':>10}{'p95 ms':>10}{'p99 ms':>10}")
     print(header)
     print("-" * len(header))
     for name in names:
         row = await run_scenario(args.url, name, args.concurrency, args.iterations, args.warmup)
         print(
-            f"{row['scenario']:<10}{row['calls']:>8}{row['errors']:>5}"
-            f"{row['rps']:>12,.1f}{row['p50_ms']:>10.2f}{row['p95_ms']:>10.2f}{row['p99_ms']:>10.2f}"
+            f"{row['scenario']:<10}{row['calls']:>7}{row['errors']:>5}"
+            f"{row['rps']:>10,.1f}{row['p50_ms']:>10.2f}{row['p75_ms']:>10.2f}"
+            f"{row['p95_ms']:>10.2f}{row['p99_ms']:>10.2f}"
         )
 
 
