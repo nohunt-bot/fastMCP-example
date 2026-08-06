@@ -127,7 +127,7 @@ def _extract_section(body: str, section: str) -> str:
 def build_server(
     skill_roots: list[Path],
     *,
-    refresh_interval: float = 5.0,
+    refresh_interval: float = 0.0,
     max_script_concurrency: int = 8,
     script_timeout: float = 30.0,
     script_stall_timeout: float = 20.0,
@@ -162,7 +162,12 @@ def build_server(
 
     @contextlib.asynccontextmanager
     async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-        """Keep the index warm from a background task, never from a request."""
+        """背景更新（預設關閉）。
+
+        skill 打包在 image 裡，pod 生命週期內不會變，週期性掃描只是燒
+        CPU 去發現「什麼都沒變」——實測 2000 個 skill 在 0.1 core 上每 5
+        秒吃掉 14% 的配額。只有 skill 來自外部掛載時才需要開啟。
+        """
 
         async def refresher() -> None:
             while True:
@@ -660,7 +665,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Stream responses over SSE instead of plain JSON replies.",
     )
-    parser.add_argument("--refresh-interval", type=float, default=5.0)
+    parser.add_argument(
+        "--refresh-interval",
+        type=float,
+        default=0.0,
+        help="背景重新掃描 skill 的間隔（秒）。預設 0（關閉）——skill 打包在 "
+        "image 裡時不會變，掃描只是浪費 CPU。skill 來自外部掛載時才設定，"
+        "建議 30-60 秒。本機開發可用 5。",
+    )
     parser.add_argument("--max-script-concurrency", type=int, default=8)
     parser.add_argument("--script-timeout", type=float, default=30.0)
     parser.add_argument(

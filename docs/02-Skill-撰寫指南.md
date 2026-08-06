@@ -47,7 +47,17 @@ skills/
         └── SKILL.md
 ```
 
-新增 skill 只要建目錄、寫 `SKILL.md`。**不用註冊、不用重啟**，5 秒內自動生效。
+新增 skill 只要建目錄、寫 `SKILL.md`，**不用註冊**。
+
+生效方式取決於部署形態：
+
+| 部署 | 怎麼生效 |
+|---|---|
+| 打包在 image（正式環境） | 重新 build 與部署 |
+| 本機開發 | 呼叫 `reload_skills`，或啟動時加 `--refresh-interval 5` |
+
+背景掃描**預設關閉**：skill 在 image 裡時 pod 生命週期內不會變，週期性
+掃描只是燒 CPU 去發現「什麼都沒變」。
 
 ## SKILL.md 最小範例
 

@@ -9,9 +9,10 @@ Design goals, in priority order:
 2. **Progressive disclosure.** Indexing parses only the YAML frontmatter, which
    means reading the first few KB of each SKILL.md instead of the whole file.
    A repo of 500 skills indexes from cold in a few ms.
-3. **Refresh off the request path.** A background task re-stats the tree on an
-   interval. Requests read an immutable snapshot, so no lock is ever held while
-   a request is being served.
+3. **Refresh is opt-in.** Skills ship inside the container image, so they cannot
+   change during a pod's lifetime — periodic rescanning would burn CPU to
+   discover nothing. `refresh()` exists for local development and for the
+   `reload_skills` tool; the background timer is off by default.
 
 The snapshot is a frozen dataclass swapped in atomically by the refresher. Since
 reads only ever bind the snapshot to a local, readers never observe a torn

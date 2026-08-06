@@ -2002,3 +2002,44 @@ def test_search_index_is_rebuilt_on_refresh(tmp_path: Path):
     assert index.refresh() is True
     hits = [card["name"] for card in index.catalog(query="退貨退款")]
     assert hits and hits[0] == "beta-two"
+
+
+# ============================ 索引更新的正確性 ==============================
+
+
+def test_refresh_still_detects_content_and_structure_changes(tmp_path: Path):
+    """refresh 必須抓到三種變動：改內容、新增、刪除。
+
+    背景輪詢預設關閉（skill 在 image 裡不會變），但 `reload_skills` 與本機
+    開發都依賴這條路徑正確。
+    """
+    first = tmp_path / "alpha-one"
+    first.mkdir()
+    first.joinpath("SKILL.md").write_text(
+        "---\nname: alpha-one\ndescription: 第一個技能，用於測試偵測行為。\n---\n第一版\n"
+    )
+    index = SkillIndex([tmp_path])
+    assert index.refresh() is False
+
+    # 1) 改內容
+    first.joinpath("SKILL.md").write_text(
+        "---\nname: alpha-one\ndescription: 第一個技能，描述已經被修改過了。\n---\n第二版\n"
+    )
+    assert index.refresh() is True, "改內容沒被偵測到"
+    assert "修改過" in index.get("alpha-one").description
+
+    # 2) 新增 skill
+    second = tmp_path / "beta-two"
+    second.mkdir()
+    second.joinpath("SKILL.md").write_text(
+        "---\nname: beta-two\ndescription: 第二個技能，用於驗證新增偵測。\n---\n內文\n"
+    )
+    assert index.refresh() is True, "新增沒被偵測到"
+    assert len(index) == 2
+
+    # 3) 刪除 skill
+    import shutil
+
+    shutil.rmtree(second)
+    assert index.refresh() is True, "刪除沒被偵測到"
+    assert len(index) == 1
