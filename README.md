@@ -8,8 +8,8 @@ Built against FastMCP **3.4.6** / Python 3.12.
 
 ```bash
 uv sync
-uv run pytest -q                 # 108 tests
-uv run python acceptance.py      # 89 驗收項目，中文報告
+uv run pytest -q                 # 128 tests
+uv run python acceptance.py      # 96 驗收項目，中文報告
 uv run skill-mcp --port 8000 --context-tokens 30000
 ```
 

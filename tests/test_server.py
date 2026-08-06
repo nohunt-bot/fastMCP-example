@@ -1526,10 +1526,12 @@ async def test_catalog_respects_the_context_budget(tmp_path: Path):
 
     payload = json.dumps(result, ensure_ascii=False)
     assert result["total"] == 300, "總數要如實回報"
-    assert result["count"] < 300, "應該有被裁掉"
+    assert result["count"] < 300, "不可能全部塞進預算"
     assert len(payload) // 3 < 30_000 * 0.2
-    assert "omitted" in result["truncated"]
-    assert "query" in result["truncated"]["hint"], "要指引模型縮小範圍，而不是加大 limit"
+    # 放不下時改為領域總覽，而不是字母序截斷
+    assert result["view"] == "overview"
+    assert "facets" in result and result["facets"]
+    assert "tags=" in result["hint"] or "query=" in result["hint"]
 
 
 # ==================== 無狀態：唯讀根檔案系統下必須能跑 ======================
@@ -1799,3 +1801,204 @@ def test_every_schema_is_valid_json():
         doc = json.loads(path.read_text())
         assert doc["$schema"] == "https://json-schema.org/draft/2020-12/schema", path.name
         assert "$id" in doc, path.name
+
+
+@pytest.mark.anyio
+async def test_overview_covers_every_area_instead_of_truncating(tmp_path: Path):
+    """目錄放不下時，模型必須仍然知道「有哪些領域」。
+
+    迴歸重點：先前的做法是按字典序截斷。315 個 skill 時，模型只看得到
+    前 6 個領域，另外 15 個完全隱形——而且它無從發現自己漏了什麼。
+    """
+    root = tmp_path / "many"
+    areas = ["billing", "delivery", "finance", "inventory", "orders",
+             "payment", "shipping", "tax", "vendor", "warehouse", "zone"]
+    for area in areas:
+        for i in range(15):
+            skill = root / f"{area}-task-{i:02d}"
+            skill.mkdir(parents=True)
+            skill.joinpath("SKILL.md").write_text(
+                f"---\nname: {area}-task-{i:02d}\n"
+                f"description: 處理{area}領域的第 {i} 類作業，含查詢、更新與狀態追蹤。\n"
+                f"tags: [{area}]\n---\n內文\n"
+            )
+
+    async with Client(build_server([root], refresh_interval=0, context_tokens=30_000)) as client:
+        overview = (await client.call_tool("list_skills", {})).data
+        drilled = (await client.call_tool("list_skills", {"tags": ["zone"]})).data
+
+    assert overview["view"] == "overview"
+    assert overview["total"] == len(areas) * 15
+    # 每個領域都必須出現在 facets 裡，一個都不能漏
+    assert set(overview["facets"]) == set(areas), (
+        f"有領域對模型隱形：{set(areas) - set(overview['facets'])}"
+    )
+    assert all(count == 15 for count in overview["facets"].values())
+    assert len(json.dumps(overview, ensure_ascii=False)) // 3 < 30_000 * 0.15
+
+    # 總覽指出的路徑必須真的可用
+    assert drilled["view"] == "list"
+    assert drilled["count"] == 15
+    assert all(card["name"].startswith("zone-") for card in drilled["skills"])
+
+
+@pytest.mark.anyio
+async def test_small_catalogue_still_returns_the_full_list(tmp_path: Path):
+    """總覽只在放不下時啟用。小目錄必須維持原本的完整清單。"""
+    root = tmp_path / "few"
+    for i in range(5):
+        skill = root / f"tool-{i}"
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            f"---\nname: tool-{i}\ndescription: 第 {i} 個工具，用於測試小型目錄的行為。\n---\n內文\n"
+        )
+    async with Client(build_server([root], refresh_interval=0, context_tokens=30_000)) as client:
+        result = (await client.call_tool("list_skills", {})).data
+    assert result["view"] == "list"
+    assert result["count"] == 5
+    assert "facets" not in result
+
+
+def test_facets_fall_back_to_the_name_prefix(tmp_path: Path):
+    """沒有 tags 的 skill 仍要能被分組，否則總覽對它們沒有幫助。"""
+    root = tmp_path / "untagged"
+    for name in ("order-lookup", "order-refund", "user-profile"):
+        skill = root / name
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: 測試用的技能，描述長度足以通過檢查。\n---\n內文\n"
+        )
+    facets = SkillIndex([root]).facets()
+    assert facets == {"order": 2, "user": 1}
+
+
+# ============================ 中文檢索（BM25 + CJK bigram）===================
+
+
+def _zh_index(tmp_path: Path) -> SkillIndex:
+    skills = [
+        ("order-lookup", "查詢內部訂單系統的狀態與明細。當使用者問到訂單編號、出貨狀態或退款進度時使用。", "order"),
+        ("order-refund", "處理訂單退款申請與退款狀態查詢。涉及金流退回、部分退款與退款失敗重試。", "order"),
+        ("inventory-check", "查詢商品庫存數量與倉庫分佈。支援單一 SKU 或批次查詢，含安全庫存判斷。", "inventory"),
+        ("shipping-track", "追蹤出貨物流狀態與預計到貨時間。串接黑貓、新竹貨運與郵局的追蹤編號。", "shipping"),
+        ("invoice-issue", "開立電子發票與折讓單。處理發票作廢、載具歸戶與捐贈碼。", "finance"),
+        ("member-profile", "查詢會員基本資料、等級與點數餘額。含會員合併與資料修改紀錄。", "member"),
+        ("payment-status", "查詢金流交易狀態。支援信用卡、ATM 轉帳與行動支付的對帳查詢。", "payment"),
+    ]
+    for name, desc, tag in skills:
+        skill = tmp_path / name
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\ntags: [{tag}]\n---\n內文\n"
+        )
+    return SkillIndex([tmp_path])
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("查訂單", "order-lookup"),
+        ("訂單狀態", "order-lookup"),
+        ("我要查詢訂單編號", "order-lookup"),
+        ("退款", "order-refund"),
+        ("庫存還有多少", "inventory-check"),
+        ("貨到哪了", "shipping-track"),      # 詞序顛倒：description 是「到貨」
+        ("物流追蹤", "shipping-track"),
+        ("發票", "invoice-issue"),
+        ("開發票給客戶", "invoice-issue"),
+        ("會員點數", "member-profile"),
+        ("刷卡有沒有成功", "payment-status"),
+    ],
+)
+def test_chinese_query_finds_the_right_skill(tmp_path: Path, query: str, expected: str):
+    """中文查詢必須命中。
+
+    迴歸重點：原本用 `query.split()` 加子字串比對，中文沒有空白所以整句
+    變成單一 token，而「查訂單」不是「查詢內部訂單系統…」的子字串。
+    這 13 個真實查詢當時只命中 1 個（8%）。
+    """
+    results = [card["name"] for card in _zh_index(tmp_path).catalog(query=query, limit=3)]
+    assert results, f"查詢 {query!r} 完全沒有結果"
+    assert results[0] == expected, f"{query!r} 的第一名是 {results[0]}，期望 {expected}"
+
+
+def test_english_search_is_not_regressed(tmp_path: Path):
+    """為中文加的切詞不能犧牲英文。"""
+    for name, desc in [
+        ("csv-profile", "Profile a CSV or TSV file with column types and null counts."),
+        ("repo-digest", "Summarise a git repository, recent commits and churn by file."),
+        ("api-fetch", "Call an HTTP JSON API with explicit timeouts and retries."),
+    ]:
+        skill = tmp_path / name
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\n內文\n"
+        )
+    index = SkillIndex([tmp_path])
+    for query, expected in [
+        ("csv", "csv-profile"),
+        ("profile a csv file", "csv-profile"),
+        ("git commits", "repo-digest"),
+        ("http timeout retries", "api-fetch"),
+    ]:
+        top = index.catalog(query=query, limit=3)
+        assert top and top[0]["name"] == expected, f"{query!r} -> {top}"
+
+
+def test_mixed_language_description_is_searchable_both_ways(tmp_path: Path):
+    """內部 skill 的說明常常中英夾雜，兩種語言都要能檢索。"""
+    skill = tmp_path / "sku-lookup"
+    skill.mkdir(parents=True)
+    skill.joinpath("SKILL.md").write_text(
+        "---\nname: sku-lookup\n"
+        "description: 查詢 SKU 商品主檔與庫存。Supports batch lookup by SKU code or barcode.\n"
+        "---\n內文\n"
+    )
+    index = SkillIndex([tmp_path])
+    for query in ("SKU", "查 SKU 庫存", "barcode", "商品主檔"):
+        assert index.catalog(query=query), f"{query!r} 找不到"
+
+
+def test_bm25_ranks_the_more_specific_skill_first(tmp_path: Path):
+    """兩個都提到「退款」時，專門處理退款的那個要排前面。"""
+    index = _zh_index(tmp_path)
+    ranked = [card["name"] for card in index.catalog(query="退款申請", limit=3)]
+    assert ranked[0] == "order-refund", ranked
+
+
+def test_tokenizer_produces_bigrams_and_unigrams():
+    from skill_server.search import tokenize
+
+    tokens = tokenize("訂單狀態")
+    assert "訂單" in tokens and "狀態" in tokens, "缺少 bigram"
+    assert "訂" in tokens, "缺少 unigram（單字查詢與詞序顛倒需要）"
+    assert "sku" in tokenize("查詢 SKU"), "英文要小寫後成詞"
+
+
+def test_tags_filter_still_applies_with_a_query(tmp_path: Path):
+    """BM25 的結果仍要受 tags 過濾。"""
+    index = _zh_index(tmp_path)
+    both = index.catalog(query="查詢", limit=10)
+    filtered = index.catalog(query="查詢", tags=["order"], limit=10)
+    assert len(filtered) < len(both)
+    assert all(card["tags"] == ["order"] for card in filtered)
+
+
+def test_search_index_is_rebuilt_on_refresh(tmp_path: Path):
+    """新增 skill 後必須立刻可被檢索，否則熱載入等於半殘。"""
+    first = tmp_path / "alpha-one"
+    first.mkdir(parents=True)
+    first.joinpath("SKILL.md").write_text(
+        "---\nname: alpha-one\ndescription: 處理第一類作業的查詢與更新。\n---\n內文\n"
+    )
+    index = SkillIndex([tmp_path])
+    assert not index.catalog(query="退貨退款")
+
+    second = tmp_path / "beta-two"
+    second.mkdir(parents=True)
+    second.joinpath("SKILL.md").write_text(
+        "---\nname: beta-two\ndescription: 處理退貨退款與折讓的申請流程。\n---\n內文\n"
+    )
+    assert index.refresh() is True
+    hits = [card["name"] for card in index.catalog(query="退貨退款")]
+    assert hits and hits[0] == "beta-two"
