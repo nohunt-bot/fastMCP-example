@@ -9,9 +9,10 @@ Design goals, in priority order:
 2. **Progressive disclosure.** Indexing parses only the YAML frontmatter, which
    means reading the first few KB of each SKILL.md instead of the whole file.
    A repo of 500 skills indexes from cold in a few ms.
-3. **Refresh off the request path.** A background task re-stats the tree on an
-   interval. Requests read an immutable snapshot, so no lock is ever held while
-   a request is being served.
+3. **Refresh is opt-in.** Skills ship inside the container image, so they cannot
+   change during a pod's lifetime — periodic rescanning would burn CPU to
+   discover nothing. `refresh()` exists for local development and for the
+   `reload_skills` tool; the background timer is off by default.
 
 The snapshot is a frozen dataclass swapped in atomically by the refresher. Since
 reads only ever bind the snapshot to a local, readers never observe a torn
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+
+from skill_server.search import SearchIndex
 
 try:  # libyaml bindings are ~10x faster and ship with most wheels
     from yaml import CSafeLoader as _YamlLoader
@@ -170,6 +173,8 @@ class _Snapshot:
     stamps: dict[str, tuple[int, int]]
     generation: int
     built_at: float
+    #: BM25 索引，與快照同生共死。建立在背景更新執行緒上，不在請求路徑。
+    search: SearchIndex = field(default_factory=SearchIndex)
 
 
 class SkillLoadError(Exception):
@@ -425,12 +430,24 @@ class SkillIndex:
 
         self._rejected = rejected
         catalog = tuple(m.card() for m in sorted(by_name.values(), key=lambda m: m.name))
+        search = SearchIndex.build(
+            (
+                name,
+                {
+                    "name": meta.name.replace("-", " "),
+                    "description": meta.description,
+                    "tags": " ".join(meta.tags),
+                },
+            )
+            for name, meta in by_name.items()
+        )
         self._snapshot = _Snapshot(
             by_name=by_name,
             catalog=catalog,
             stamps=stamps,
             generation=self._snapshot.generation + 1,
             built_at=time.time(),
+            search=search,
         )
         # Drop bodies for skills that vanished; edited ones self-invalidate.
         for stale in [n for n in self._body_cache if n not in by_name]:
@@ -447,6 +464,21 @@ class SkillIndex:
     def __len__(self) -> int:
         return len(self._snapshot.by_name)
 
+    def facets(self, snap: "_Snapshot | None" = None) -> dict[str, int]:
+        """領域 -> skill 數。用於目錄放不下時的總覽。
+
+        領域取自 tags；沒有 tags 的 skill 以名稱的第一段推導
+        （kebab-case 的第一個 token），因為那通常就是領域前綴
+        （order-lookup、order-refund → order）。
+        """
+        snap = snap or self._snapshot
+        counts: dict[str, int] = {}
+        for meta in snap.by_name.values():
+            keys = meta.tags or (meta.name.split("-")[0],)
+            for key in keys:
+                counts[key] = counts.get(key, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
     def catalog(
         self,
         *,
@@ -460,27 +492,52 @@ class SkillIndex:
             return list(snap.catalog[:limit])
 
         wanted = {t.lower() for t in tags} if tags else None
-        terms = query.lower().split() if query else []
-        scored: list[tuple[int, str, dict[str, Any]]] = []
 
+        if query:
+            # BM25。取代原本的子字串比對——後者對中文完全無效：查詢會被
+            # 當成單一 token，而「查訂單」不是「查詢內部訂單系統…」的
+            # 子字串。實測 13 個真實中文查詢只命中 1 個。
+            ranked = snap.search.search(query, limit=limit * 4 if wanted else limit)
+            cards: list[dict[str, Any]] = []
+            for name, _score in ranked:
+                meta = snap.by_name.get(name)
+                if meta is None:
+                    continue
+                if wanted and not wanted.issubset(meta.tags):
+                    continue
+                cards.append(meta.card())
+                if len(cards) >= limit:
+                    break
+            return cards
+
+        scored: list[tuple[int, str, dict[str, Any]]] = []
         for meta in snap.by_name.values():
             if wanted and not wanted.issubset(meta.tags):
                 continue
-            score = 0
-            if terms:
-                for term in terms:
-                    if term in meta.name.lower():
-                        score += 8
-                    elif any(term in tag for tag in meta.tags):
-                        score += 4
-                    elif term in meta.haystack:
-                        score += 1
-                if score == 0:
-                    continue
-            scored.append((-score, meta.name, meta.card()))
+            scored.append((0, meta.name, meta.card()))
 
         scored.sort(key=lambda row: (row[0], row[1]))
         return [card for _, _, card in scored[:limit]]
+
+    def sample_per_facet(self, per: int = 1, limit: int = 40) -> list[dict[str, Any]]:
+        """每個領域取幾個代表。
+
+        目的是讓模型知道「每個領域的 skill 長什麼樣」，而不是只拿到
+        字母序前 N 個——後者會讓整個領域對模型隱形。
+        """
+        snap = self._snapshot
+        buckets: dict[str, list[SkillMeta]] = {}
+        for meta in sorted(snap.by_name.values(), key=lambda m: m.name):
+            key = (meta.tags or (meta.name.split("-")[0],))[0]
+            buckets.setdefault(key, []).append(meta)
+
+        out: list[dict[str, Any]] = []
+        for key in sorted(buckets, key=lambda k: (-len(buckets[k]), k)):
+            for meta in buckets[key][:per]:
+                out.append(meta.card())
+                if len(out) >= limit:
+                    return out
+        return out
 
     def get(self, name: str) -> SkillMeta:
         meta = self._snapshot.by_name.get(name)

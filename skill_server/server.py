@@ -127,7 +127,7 @@ def _extract_section(body: str, section: str) -> str:
 def build_server(
     skill_roots: list[Path],
     *,
-    refresh_interval: float = 5.0,
+    refresh_interval: float = 0.0,
     max_script_concurrency: int = 8,
     script_timeout: float = 30.0,
     script_stall_timeout: float = 20.0,
@@ -162,7 +162,12 @@ def build_server(
 
     @contextlib.asynccontextmanager
     async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-        """Keep the index warm from a background task, never from a request."""
+        """背景更新（預設關閉）。
+
+        skill 打包在 image 裡，pod 生命週期內不會變，週期性掃描只是燒
+        CPU 去發現「什麼都沒變」——實測 2000 個 skill 在 0.1 core 上每 5
+        秒吃掉 14% 的配額。只有 skill 來自外部掛載時才需要開啟。
+        """
 
         async def refresher() -> None:
             while True:
@@ -225,24 +230,56 @@ def build_server(
         skills costs a few thousand tokens rather than a few hundred thousand.
         Pick one and call load_skill.
         """
-        cards = index.catalog(query=query, tags=tags, limit=limit)
+        budget = catalog_budget_bytes
 
-        # The one place progressive disclosure could still blow the window:
-        # 500 skills is ~23k tokens, i.e. 78% of a 30k context, before the user
-        # has said anything. Trim to the budget and say so, so the model narrows
-        # with `query`/`tags` instead of silently seeing a partial library.
+        def size(payload: Any) -> int:
+            return len(json.dumps(payload, ensure_ascii=False).encode())
+
+        # 無篩選時以**完整目錄**判斷，不能用 limit 截斷後的結果——預設
+        # limit=50 會讓它永遠看似放得下，總覽就再也不會啟用。
+        cards = index.catalog(
+            query=query, tags=tags,
+            limit=len(index) if not query and not tags else limit,
+        )
+
+        # 沒有篩選條件、而且完整目錄放不下時，改回傳「領域總覽」而不是
+        # 字母序的前 N 個。
+        #
+        # 直接截斷會讓整個領域對模型隱形：實測 315 個 skill 時，模型只
+        # 看得到字母序前 6 個領域，另外 15 個完全不知道存在——而且它沒有
+        # 辦法發現自己漏了什麼。總覽用差不多的 token 數涵蓋全部領域。
+        if not query and not tags and size(cards) > budget:
+            facets = index.facets()
+            samples = index.sample_per_facet(per=1, limit=40)
+            while samples and size(samples) > budget // 2:
+                samples.pop()
+            return {
+                "count": len(samples),
+                "total": len(index),
+                "view": "overview",
+                "facets": facets,
+                "skills": samples,
+                "hint": (
+                    f"目錄有 {len(index)} 個 skill，放不進 context，因此改為領域"
+                    f"總覽：facets 是「領域 -> 數量」，skills 是每個領域的一個代表。"
+                    f"用 tags=['<領域>'] 或 query='<關鍵字>' 取得該領域的完整清單。"
+                ),
+            }
+
+        cards = cards[:limit]
         dropped = 0
-        while cards and len(json.dumps(cards, ensure_ascii=False).encode()) > catalog_budget_bytes:
+        while cards and size(cards) > budget:
             cards.pop()
             dropped += 1
 
-        result: dict[str, Any] = {"count": len(cards), "total": len(index), "skills": cards}
+        result: dict[str, Any] = {
+            "count": len(cards), "total": len(index), "view": "list", "skills": cards,
+        }
         if dropped:
             result["truncated"] = {
                 "omitted": dropped,
-                "hint": "The catalogue exceeds the context budget. Narrow it with "
-                "`query` or `tags` rather than raising `limit` -- the omitted "
-                "skills are not visible to you at all.",
+                "hint": "結果超過 context 預算。用更精確的 query 或 tags 縮小範圍，"
+                        "不要調大 limit——被省略的 skill 對你完全不可見。",
             }
         return result
 
@@ -628,7 +665,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Stream responses over SSE instead of plain JSON replies.",
     )
-    parser.add_argument("--refresh-interval", type=float, default=5.0)
+    parser.add_argument(
+        "--refresh-interval",
+        type=float,
+        default=0.0,
+        help="背景重新掃描 skill 的間隔（秒）。預設 0（關閉）——skill 打包在 "
+        "image 裡時不會變，掃描只是浪費 CPU。skill 來自外部掛載時才設定，"
+        "建議 30-60 秒。本機開發可用 5。",
+    )
     parser.add_argument("--max-script-concurrency", type=int, default=8)
     parser.add_argument("--script-timeout", type=float, default=30.0)
     parser.add_argument(
