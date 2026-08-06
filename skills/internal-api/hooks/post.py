@@ -4,8 +4,11 @@
 stdin  : {"skill","script","args","result"}
 stdout : optional JSON -- {"result":{...}} to replace it
 exit   : 0 accepts, non-zero fails the call
+
+不寫任何檔案：服務跑在唯讀檔案系統上。要稽核就把事件送到你的 API 或
+標準輸出（容器日誌會收），不要寫本地檔案。
 """
-import json, os, pathlib, sys, time
+import json, sys
 
 req = json.load(sys.stdin)
 result = req.get("result", {})
@@ -17,13 +20,7 @@ if req["script"].endswith("submit.py") and result.get("status") == "ok" \
     print(json.dumps({"reason": "submit exited 0 but printed nothing -- the job handle is lost"}))
     sys.exit(1)
 
-if state := os.getenv("SKILL_STATE_DIR"):
-    line = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "script": req.get("script"),
-            "status": result.get("status"), "output": result.get("stdout", "")[:200]}
-    path = pathlib.Path(state) / "audit.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        fh.write(json.dumps(line) + "\n")
-
+# 稽核走 stderr -> 容器日誌 -> 你的日誌系統，不落地成檔案
+print(f"AUDIT script={req.get('script')} status={result.get('status')}", file=sys.stderr)
 result["audited"] = True
 print(json.dumps({"result": result}))

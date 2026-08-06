@@ -12,12 +12,11 @@ Two commands cover it:
     submit  -> POST, print the key, exit. Never waits.
     fetch   -> GET the result by key, once the work has landed in the database.
 
-The failure mode this design has is not orphaned jobs — the job is meant to run
-to completion — it is **losing the key**. A key that only ever existed in the
-model's context is gone the moment that context rolls, and the result then sits
-in the database with no way to address it. So `submit` also appends the key to a
-local ledger under SKILL_STATE_DIR, and `list` reads it back. The ledger is the
-memory the model does not have.
+This script writes nothing: the server runs on a read-only filesystem and keeps
+no state. The job key exists only in the response, so the **caller** is
+responsible for holding on to it — and your API should accept an
+idempotency key on submit, so a lost response can be retried without creating a
+second job.
 
 `await` exists for the occasional case where you genuinely need the result in
 the same turn. It is bounded and heartbeating, but on this architecture you
@@ -25,7 +24,6 @@ usually should not be using it.
 """
 from __future__ import annotations
 import argparse, json, os, sys, time, urllib.error, urllib.request
-from pathlib import Path
 
 DONE = {"done", "completed", "succeeded", "success", "finished", "failed", "error", "cancelled"}
 
@@ -40,40 +38,6 @@ def emit(obj: dict) -> None:
     json.dump(obj, sys.stdout, ensure_ascii=False, indent=2, default=str)
     sys.stdout.write("\n")
     sys.stdout.flush()
-
-
-def ledger_path() -> Path | None:
-    state = os.getenv("SKILL_STATE_DIR")
-    return Path(state) / "jobs.jsonl" if state else None
-
-
-def record(entry: dict) -> str | None:
-    """Append-only, one JSON object per line. Append-only matters: two concurrent
-    submits must not be able to lose each other's key."""
-    path = ledger_path()
-    if path is None:
-        return None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-    return str(path)
-
-
-def read_ledger(limit: int, contains: str | None) -> list[dict]:
-    path = ledger_path()
-    if path is None or not path.exists():
-        return []
-    rows = []
-    with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    if contains:
-        needle = contains.lower()
-        rows = [r for r in rows if needle in json.dumps(r, ensure_ascii=False).lower()]
-    return rows[-limit:][::-1]  # newest first
 
 
 def request(url: str, *, method: str, headers: dict, body: bytes | None, timeout: float):
@@ -122,7 +86,7 @@ def resolve(url: str, key: str) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=["submit", "fetch", "list", "await"])
+    p.add_argument("action", choices=["submit", "fetch", "await"])
     p.add_argument("url", nargs="?", default="", help="endpoint (not needed for list)")
     p.add_argument("--key")
     p.add_argument("--body", help="JSON request body for submit")
@@ -132,20 +96,11 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=float(os.getenv("HTTP_TIMEOUT", "10")),
                    help="per-HTTP-request timeout; NOT the job duration")
     p.add_argument("--key-field", default="key,id,job_id,task_id,uuid,request_id")
-    p.add_argument("--label", help="note stored with the key, so `list` is readable later")
-    p.add_argument("--limit", type=int, default=10, help="list: how many recent keys")
-    p.add_argument("--grep", help="list: only entries matching this text")
+    p.add_argument("--label", help="free-text note echoed back with the key")
     p.add_argument("--max-wait", type=float, default=60.0, help="await only")
     p.add_argument("--interval", type=float, default=2.0, help="await only")
     p.add_argument("--heartbeat", type=float, default=5.0, help="await only")
     args = p.parse_args()
-
-    # ------------------------------------------------------------------ list
-    if args.action == "list":
-        rows = read_ledger(args.limit, args.grep)
-        emit({"ok": True, "action": "list", "count": len(rows),
-              "ledger": str(ledger_path() or "(SKILL_STATE_DIR not set)"), "jobs": rows})
-        return 0
 
     if not args.url:
         emit({"ok": False, "error": "usage", "detail": "url is required for this action"})
@@ -164,15 +119,13 @@ def main() -> int:
             status, payload = request(args.url, method=args.method or "POST",
                                       headers=headers, body=body, timeout=args.timeout)
             key = dig(payload, args.key_field.split(","))
-            ledger = record({
-                "key": key, "label": args.label or "", "url": args.url,
-                "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "http_status": status,
-            }) if key else None
-            progress(f"key={key} recorded in {ledger}" if ledger else f"key={key} (no ledger)")
+            progress(f"key={key}")
             emit({"ok": key is not None, "action": "submit", "http_status": status,
-                  "key": key, "label": args.label or "", "ledger": ledger, "response": payload,
+                  "key": key, "label": args.label or "",
+                  "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "response": payload,
                   "next": "The job now runs to completion on its own. Do not wait for it. "
-                          f"Collect it later with: fetch --key {key}" if key else
+                          "Return this key to the caller -- nothing here remembers it. "
+                          f"Collect the result later with: fetch --key {key}" if key else
                           "no job key found in the response; pass --key-field with the right name"})
             return 0 if key else 1
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import contextlib
 import logging
 import os
@@ -38,6 +39,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.utilities.tasks import TaskConfig
 from pydantic import Field
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from skill_server import shaping
 from skill_server.hooks import HookDenied, HookRunner
@@ -133,14 +135,17 @@ def build_server(
     enable_tasks: bool = False,
     context_tokens: int = 128_000,
     context_share: float = 0.25,
-    state_root: Path | None = None,
     global_hooks_dir: Path | None = None,
+    shutdown_grace: float = 25.0,
 ) -> FastMCP:
     index = SkillIndex(skill_roots)
     # Everything downstream is sized from the client's context window, not from
     # what the disk can produce. On a 30 K local model this is the difference
     # between a usable tool and one that stalls the model on every call.
     output_budget_bytes = shaping.budget_bytes_for(context_tokens, context_share)
+    # The catalogue is paid for on *every* session, so it gets a tighter share
+    # than a one-off tool result: it must leave room for the work itself.
+    catalog_budget_bytes = shaping.budget_bytes_for(context_tokens, context_share / 2)
     runner = ScriptRunner(
         index,
         max_concurrency=max_script_concurrency,
@@ -151,7 +156,6 @@ def build_server(
         # from, just not unbounded.
         output_cap_bytes=max(output_budget_bytes * 8, 64 * 1024),
         output_budget_bytes=output_budget_bytes,
-        state_root=state_root or (Path.home() / ".skill-mcp" / "state"),
     )
     hooks = HookRunner(runner, global_hooks_dir)
     timing = TimingMiddleware()
@@ -178,6 +182,11 @@ def build_server(
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            # Let in-flight scripts finish before the process goes away. On a
+            # rolling update this is the difference between a submitted job
+            # reporting its uuid and that uuid being lost while the work runs on.
+            remaining = await runner.drain(shutdown_grace)
+            logger.info("shutdown complete (%d script(s) abandoned)", remaining)
 
     mcp = FastMCP(
         name="skill-server",
@@ -217,7 +226,25 @@ def build_server(
         Pick one and call load_skill.
         """
         cards = index.catalog(query=query, tags=tags, limit=limit)
-        return {"count": len(cards), "total": len(index), "skills": cards}
+
+        # The one place progressive disclosure could still blow the window:
+        # 500 skills is ~23k tokens, i.e. 78% of a 30k context, before the user
+        # has said anything. Trim to the budget and say so, so the model narrows
+        # with `query`/`tags` instead of silently seeing a partial library.
+        dropped = 0
+        while cards and len(json.dumps(cards, ensure_ascii=False).encode()) > catalog_budget_bytes:
+            cards.pop()
+            dropped += 1
+
+        result: dict[str, Any] = {"count": len(cards), "total": len(index), "skills": cards}
+        if dropped:
+            result["truncated"] = {
+                "omitted": dropped,
+                "hint": "The catalogue exceeds the context budget. Narrow it with "
+                "`query` or `tags` rather than raising `limit` -- the omitted "
+                "skills are not visible to you at all.",
+            }
+        return result
 
     # ---------------------------------------------------------------- level 2
 
@@ -489,6 +516,73 @@ def build_server(
             "removed": sorted(names_before - names_after),
         }
 
+    # ------------------------------------------------------- operational HTTP
+    # Plain HTTP, deliberately outside MCP: a k8s probe cannot speak JSON-RPC,
+    # and an operator debugging at 3am should be able to curl this. Note that
+    # GET /mcp returns 405 (the MCP endpoint only accepts POST), so pointing a
+    # readiness probe at it makes the pod permanently NotReady.
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request):  # noqa: ARG001
+        """Liveness: the process is up and the event loop is responsive."""
+        return JSONResponse({"status": "ok", "skills": len(index)})
+
+    @mcp.custom_route("/ready", methods=["GET"])
+    async def ready(request):  # noqa: ARG001
+        """Readiness: refuse traffic until at least one skill is actually served.
+
+        An empty index means a misconfigured --skills path or a tree where every
+        skill was rejected. Serving that is worse than not serving: the model
+        gets an empty catalogue and concludes the tools do not exist.
+        """
+        rejected = index.stats()["rejected"]
+        healthy = len(index) > 0
+        return JSONResponse(
+            {
+                "status": "ready" if healthy else "no skills loaded",
+                "skills": len(index),
+                "rejected": len(rejected),
+                "generation": index.generation,
+            },
+            status_code=200 if healthy else 503,
+        )
+
+    @mcp.custom_route("/metrics", methods=["GET"])
+    async def metrics(request):  # noqa: ARG001
+        """Prometheus text format. Enough to alert on, not a full metrics stack."""
+        lines = [
+            "# HELP skill_mcp_skills Number of skills currently served.",
+            "# TYPE skill_mcp_skills gauge",
+            f"skill_mcp_skills {len(index)}",
+            "# HELP skill_mcp_skills_rejected Skills on disk that failed validation.",
+            "# TYPE skill_mcp_skills_rejected gauge",
+            f"skill_mcp_skills_rejected {len(index.stats()['rejected'])}",
+            "# HELP skill_mcp_scripts_total Scripts launched since start.",
+            "# TYPE skill_mcp_scripts_total counter",
+            f"skill_mcp_scripts_total {runner.launched}",
+            "# HELP skill_mcp_scripts_failed_total Scripts that exited non-zero.",
+            "# TYPE skill_mcp_scripts_failed_total counter",
+            f"skill_mcp_scripts_failed_total {runner.failed}",
+            "# HELP skill_mcp_scripts_timeout_total Scripts killed at the ceiling.",
+            "# TYPE skill_mcp_scripts_timeout_total counter",
+            f"skill_mcp_scripts_timeout_total {runner.timeouts}",
+            "# HELP skill_mcp_scripts_stalled_total Scripts killed for going silent.",
+            "# TYPE skill_mcp_scripts_stalled_total counter",
+            f"skill_mcp_scripts_stalled_total {runner.stalls}",
+            "# HELP skill_mcp_script_slots_free Free slots in the concurrency semaphore.",
+            "# TYPE skill_mcp_script_slots_free gauge",
+            f"skill_mcp_script_slots_free {runner.stats()['slots_available']}",
+        ]
+        for tool, stat in timing.snapshot().items():
+            safe = tool.replace("-", "_")
+            lines += [
+                f'skill_mcp_tool_calls_total{{tool="{safe}"}} {stat["calls"]}',
+                f'skill_mcp_tool_errors_total{{tool="{safe}"}} {stat["errors"]}',
+                f'skill_mcp_tool_latency_p50_ms{{tool="{safe}"}} {stat["p50_ms"]}',
+                f'skill_mcp_tool_latency_p95_ms{{tool="{safe}"}} {stat["p95_ms"]}',
+            ]
+        return PlainTextResponse("\n".join(lines) + "\n")
+
     # ----------------------------------------------------------------- resources
     # Same data as the tools, for clients that prefer attaching resources over
     # spending a tool call.
@@ -559,14 +653,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Requires: uv sync --extra tasks (pulls in pydocket + Redis).",
     )
     parser.add_argument(
-        "--state-dir",
-        type=Path,
-        default=None,
-        help="Writable per-skill directory that survives across calls, exposed to "
-        "scripts as SKILL_STATE_DIR. Fire-and-forget work records its job keys "
-        "here so they outlive the model's context (default ~/.skill-mcp/state).",
-    )
-    parser.add_argument(
         "--hooks-dir",
         type=Path,
         default=None,
@@ -587,6 +673,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Fraction of the context window a single tool result may occupy.",
+    )
+    parser.add_argument(
+        "--shutdown-grace",
+        type=float,
+        default=25.0,
+        help="關機時等待執行中 script 的秒數。要小於 k8s 的 "
+        "terminationGracePeriodSeconds，否則 SIGKILL 會先到。",
     )
     parser.add_argument("--log-level", default="info")
     return parser.parse_args(argv)
@@ -615,11 +708,16 @@ def main(argv: list[str] | None = None) -> None:
         enable_tasks=args.enable_tasks,
         context_tokens=args.context_tokens,
         context_share=args.context_share,
-        state_root=args.state_dir,
         global_hooks_dir=args.hooks_dir,
+        shutdown_grace=args.shutdown_grace,
     )
     mcp.run(
         transport="http",
+        # uvicorn 才是真正決定 in-flight 請求命運的一方：它會在呼叫 lifespan
+        # 的 shutdown 之前就取消未完成的請求。所以 runner.drain() 只是最後
+        # 防線，真正讓執行中的 script 有機會跑完的是這個設定。
+        # 值要小於 k8s 的 terminationGracePeriodSeconds，否則 SIGKILL 會先到。
+        uvicorn_config={"timeout_graceful_shutdown": int(args.shutdown_grace)},
         host=args.host,
         port=args.port,
         path=args.path,

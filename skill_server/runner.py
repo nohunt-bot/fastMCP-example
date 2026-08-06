@@ -12,6 +12,8 @@ Controls, in the order they apply:
   (see :meth:`SkillIndex.resolve_file`) and live under ``scripts/``.
 * **Interpreter allowlist** — dispatch on suffix; no shell, ever. Arguments are
   passed as an argv list, so quoting/injection is not a category that exists.
+* **Writes nothing** — the server creates no files and hands scripts no writable
+  directory, so it runs unchanged on a read-only root filesystem.
 * **Curated environment** — the child gets an allowlist, not ``os.environ``, so
   API keys in the server's environment are not inherited. Proxy and TLS trust
   variables are passed through by default because without them every outbound
@@ -37,7 +39,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import shutil
 import signal
 import sys
@@ -91,15 +92,14 @@ _NETWORK_ENV = (
 #: a configuration option.
 #:
 #: The SKILL_* entries are here for a different reason: they are the server's
-#: own statements about identity and state, and a caller must not be able to
-#: forge them (e.g. redirect SKILL_STATE_DIR at another skill's ledger).
+#: own statements about identity, and a caller must not be able to forge them.
 _CALLER_FORBIDDEN_ENV = frozenset({
     "PATH", "SHELL", "IFS", "BASH_ENV", "ENV", "CDPATH", "GLOBIGNORE",
     "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
     "PYTHONWARNINGS", "PYTHONINSPECT",
     "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
     "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB",
-    "SKILL_NAME", "SKILL_DIR", "SKILL_STATE_DIR", "SKILL_OUTPUT_BUDGET_BYTES",
+    "SKILL_NAME", "SKILL_DIR", "SKILL_OUTPUT_BUDGET_BYTES",
 })
 #: Any variable starting with one of these is refused: the dynamic-linker
 #: families are the classic code-injection vector (LD_PRELOAD, DYLD_INSERT_LIBRARIES).
@@ -124,12 +124,6 @@ def check_caller_env(env: dict[str, str]) -> None:
                 "which program runs, not how it behaves. Pass data (tokens, URLs) "
                 "instead, or set it in the skill's own execution policy."
             )
-
-
-def _safe_dirname(name: str) -> str:
-    """Collapse a skill name into a single safe path component."""
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._") or "unnamed"
-    return cleaned[:120]
 
 
 class ScriptError(Exception):
@@ -248,14 +242,8 @@ class ScriptRunner:
         output_cap_bytes: int = 256 * 1024,
         output_budget_bytes: int | None = None,
         pass_network_env: bool = True,
-        state_root: Path | None = None,
     ):
         self.index = index
-        #: Per-skill writable directory that survives across calls. Fire-and-forget
-        #: work needs somewhere to record its handles: a job id that only ever
-        #: existed in the model's context is lost the moment the context rolls,
-        #: and the result then sits in a database nobody can address.
-        self.state_root = Path(state_root).expanduser().resolve() if state_root else None
         self.default_timeout = default_timeout
         self.max_timeout = max_timeout
         self.default_stall_timeout = default_stall_timeout
@@ -270,6 +258,32 @@ class ScriptRunner:
         self.failed = 0
         self.timeouts = 0
         self.stalls = 0
+        self._in_flight = 0
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    async def drain(self, timeout: float = 25.0) -> int:
+        """Wait for running scripts to finish. Returns how many were still going.
+
+        Called on shutdown. Without it, a rolling update SIGKILLs scripts
+        mid-flight: for a fire-and-forget submit that has already reached the
+        API but not yet printed its uuid, the job runs to completion server-side
+        while the handle is lost forever.
+
+        Bounded, because k8s only grants terminationGracePeriodSeconds before it
+        sends SIGKILL anyway.
+        """
+        deadline = time.monotonic() + timeout
+        while self._in_flight and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        if self._in_flight:
+            logger.warning(
+                "shutting down with %d script(s) still running; their output is lost",
+                self._in_flight,
+            )
+        return self._in_flight
 
     def _build_argv(self, skill: str, script: str, args: Sequence[str]) -> tuple[list[str], Path]:
         try:
@@ -417,12 +431,6 @@ class ScriptRunner:
             # and gets reduced afterwards: the reduction can only guess which
             # rows mattered, the script's own filter cannot.
             child_env["SKILL_OUTPUT_BUDGET_BYTES"] = str(self.output_budget_bytes)
-        if self.state_root is not None:
-            # Never build a path straight from a skill-supplied name: a skill
-            # called "../../etc" would otherwise place its state outside the root.
-            state_dir = self.state_root / _safe_dirname(skill)
-            state_dir.mkdir(parents=True, exist_ok=True)
-            child_env["SKILL_STATE_DIR"] = str(state_dir)
         if env:
             for key in env:
                 if not key.replace("_", "").isalnum():
@@ -433,71 +441,88 @@ class ScriptRunner:
         if stdin is not None and len(stdin.encode()) > MAX_STDIN_BYTES:
             raise ScriptError(
                 f"stdin is {len(stdin.encode()):,} bytes, over the "
-                f"{MAX_STDIN_BYTES:,} limit. Write it to a file under "
-                "SKILL_STATE_DIR and pass the path instead."
+                f"{MAX_STDIN_BYTES:,} limit. Send it to your API in chunks, or "
+                "have the script fetch it from a URL instead of receiving it inline."
             )
 
         state = _Capture(cap=self.output_cap_bytes)
 
         async with self._semaphore:
             self.launched += 1
+            self._in_flight += 1
             started = time.monotonic()
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(meta_directory),
-                env=child_env,
-                start_new_session=True,  # own process group, so we can kill the tree
-            )
-
-            pumps = [
-                asyncio.create_task(_pump(proc.stdout, "stdout", state, on_output)),
-                asyncio.create_task(_pump(proc.stderr, "stderr", state, on_output)),
-            ]
-            waiter = asyncio.create_task(proc.wait())
-            timed_out = stalled = False
-
+            # _in_flight must come back down even when this coroutine is
+            # cancelled -- which is exactly what uvicorn does to in-flight
+            # requests on shutdown. Decrementing at the end of the happy path
+            # leaked one per cancelled call, and a leaked counter makes drain()
+            # wait out its full timeout on every subsequent shutdown.
             try:
-                if stdin is not None and proc.stdin is not None:
-                    proc.stdin.write(stdin.encode())
-                    await proc.stdin.drain()
-                    proc.stdin.close()
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(meta_directory),
+                    env=child_env,
+                    start_new_session=True,  # own process group, so we can kill the tree
+                )
 
+                pumps = [
+                    asyncio.create_task(_pump(proc.stdout, "stdout", state, on_output)),
+                    asyncio.create_task(_pump(proc.stderr, "stderr", state, on_output)),
+                ]
+                waiter = asyncio.create_task(proc.wait())
+                timed_out = stalled = False
                 deadline = started + limit
-                while True:
-                    now = time.monotonic()
-                    slices = [deadline - now]
-                    if stall > 0:
-                        slices.append(state.last_activity + stall - now)
-                    nap = min(slices)
 
-                    if nap <= 0:
-                        # Whichever budget expired first decides the verdict.
-                        if now >= deadline:
-                            timed_out = True
-                        else:
-                            stalled = True
-                        break
+                try:
+                    if stdin is not None and proc.stdin is not None:
+                        proc.stdin.write(stdin.encode())
+                        await proc.stdin.drain()
+                        proc.stdin.close()
 
-                    done, _ = await asyncio.wait({waiter}, timeout=nap)
-                    if done:
-                        break
+                    while True:
+                        now = time.monotonic()
+                        slices = [deadline - now]
+                        if stall > 0:
+                            slices.append(state.last_activity + stall - now)
+                        nap = min(slices)
+
+                        if nap <= 0:
+                            # Whichever budget expired first decides the verdict.
+                            if now >= deadline:
+                                timed_out = True
+                            else:
+                                stalled = True
+                            break
+
+                        done, _ = await asyncio.wait({waiter}, timeout=nap)
+                        if done:
+                            break
+                finally:
+                    if proc.returncode is None:
+                        self._kill_tree(proc)
+                        with_timeout = asyncio.wait_for(asyncio.shield(waiter), timeout=5)
+                        try:
+                            await with_timeout
+                        except (asyncio.TimeoutError, asyncio.CancelledError):  # pragma: no cover
+                            logger.error("process %s survived SIGKILL", proc.pid)
+                    # Readers normally finish on EOF. But EOF is not guaranteed:
+                    # a script that spawns a grandchild without redirecting its
+                    # output leaves that grandchild holding our stdout pipe, so the
+                    # pipe stays open after our own child has exited. Waiting a
+                    # fixed period here let such a call outlive the timeout the
+                    # caller was promised (2 s requested, 5 s actual).
+                    #
+                    # So the wait is capped by whatever budget is left, with a small
+                    # floor to let already-buffered output drain.
+                    grace = max(0.25, min(2.0, deadline - time.monotonic()))
+                    await asyncio.wait(pumps, timeout=grace)
+                    for pump in pumps:
+                        pump.cancel()
+
             finally:
-                if proc.returncode is None:
-                    self._kill_tree(proc)
-                    with_timeout = asyncio.wait_for(asyncio.shield(waiter), timeout=5)
-                    try:
-                        await with_timeout
-                    except (asyncio.TimeoutError, asyncio.CancelledError):  # pragma: no cover
-                        logger.error("process %s survived SIGKILL", proc.pid)
-                # Readers finish on EOF, which the kill guarantees. Everything
-                # they already captured is in `state` regardless.
-                await asyncio.wait(pumps, timeout=5)
-                for pump in pumps:
-                    pump.cancel()
-
+                self._in_flight -= 1
             duration_ms = (time.monotonic() - started) * 1000
             silent_for = time.monotonic() - state.last_activity
 
@@ -577,6 +602,7 @@ class ScriptRunner:
             "timeouts": self.timeouts,
             "stalls": self.stalls,
             "max_concurrency": self._max_concurrency,
+            "in_flight": self._in_flight,
             "slots_available": self._semaphore._value,  # noqa: SLF001 - diagnostics only
             "interpreters": sorted(INTERPRETERS),
             "network_env_forwarded": self.pass_network_env,

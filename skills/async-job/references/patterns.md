@@ -2,29 +2,24 @@
 
 ## The workflow
 
-1. `submit` with a `--label`. Record nothing manually — the ledger does it.
-2. Do something else. The job runs on its own; do not poll it.
-3. Later, `list` to find the key, then `fetch --key <uuid>` for the result.
+1. `submit` → **把回應裡的 uuid 交給呼叫端**，服務不會替你記住。
+2. 讓它去跑。任務自己會完成，不要輪詢。
+3. 之後用 `fetch --key <uuid>` 取結果。
 
-Step 3 can happen in a completely different session. That is the whole point.
+第 3 步可以在完全不同的 session 進行——前提是 uuid 有被保管好。
 
-## Why the ledger matters more than it looks
+## uuid 沒有任何地方會保存
 
-The job always completes. What fails is remembering how to ask for it:
+服務不寫檔案。uuid 只存在於 `submit` 的回應裡，回應遺失就沒有第二份。
 
-- a 30 K context window rolls over in minutes of ordinary work
-- the model that submitted the job may not be the one collecting it
-- a restart, a new session, or a cleared conversation all lose in-context keys
+實務上會遺失回應的情況：滾動更新、連線中斷、pod 被驅逐。要讓這些都不痛，
+唯一可靠的做法是**你的 API 支援 idempotency key**：
 
-The ledger (`$SKILL_STATE_DIR/jobs.jsonl`) is append-only, one JSON object per
-line, so concurrent submits cannot clobber each other. It is plain text — read
-it with anything.
+- 送出時帶一個由呼叫端產生的 key
+- 客戶端沒收到回應時重送同一個 key
+- API 回同一個 uuid，而不是建立第二個任務
 
-## Labels
-
-`--label "q3 revenue report"` costs nothing at submit time and is the difference
-between a usable ledger and a list of uuids. Include what the job was *for*, not
-what endpoint it hit — the endpoint is already recorded.
+只有你的 API 知道什麼算「同一個任務」，這件事沒辦法在 MCP 這層補償。
 
 ## Fetching
 
@@ -44,8 +39,4 @@ work synchronously before handing back the key, and the async boundary is in the
 wrong place — that is a backend fix, not something to paper over with a longer
 timeout.
 
-## Housekeeping
 
-The ledger grows without bound. It is one line per job, so this takes a long
-time to matter, but it is a plain file: rotate or truncate it on whatever
-schedule suits. Nothing reads it except `list`.
