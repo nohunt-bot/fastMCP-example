@@ -130,6 +130,7 @@ if budget and len(text.encode()) > budget:
 |---|---|
 | `SKILL_NAME` | 目前 skill 的名稱 |
 | `SKILL_DIR` | skill 目錄的絕對路徑 |
+| `SKILL_ROOT` | 該 skill 所屬的 skill 根目錄（給共用函式庫用） |
 | `SKILL_OUTPUT_BUDGET_BYTES` | 建議的輸出上限 |
 | `HTTP_PROXY` 等 | 公司 proxy 與 TLS 設定（自動轉發） |
 
@@ -230,6 +231,44 @@ print("已派工")                                   # script 立刻結束
 到孫行程跑完。
 
 導開之後：script **0.04 秒返回**，孫行程繼續跑到完成。兩項都有測試釘住。
+
+## 多個 skill 共用程式碼
+
+skill 之間**不能互相呼叫**——`load_skill` 一次就是幾百 tokens，而編排者是
+模型不是程式。所以重用要發生在 **script 層**，模型完全看不到，成本 0 tokens。
+
+```
+skills/
+├── _shared/
+│   └── lib.sh              ← 沒有 SKILL.md，不會被掃成 skill
+├── return-process/
+│   └── scripts/run.sh
+└── finance/
+    └── invoice-issue/
+        └── scripts/run.sh
+```
+
+```bash
+#!/bin/bash
+set -euo pipefail
+source "$SKILL_ROOT/_shared/lib.sh"      # 不論在第幾層都正確
+api_call GET "$API_BASE/orders"
+```
+
+**一定要用 `$SKILL_ROOT`，不要用 `$SKILL_DIR/../`。** 後者在命名空間子目錄
+（`skills/<team>/<skill>/`）下會少算一層，指到 `skills/<team>/` 而不是
+`skills/`，source 直接失敗。
+
+### 兩個要知道的邊界
+
+**`_shared/` 不受路徑 jail 保護。** jail 只約束「哪些檔案可被當成 script
+執行」；script 一旦跑起來就是普通行程，能讀任何有權限的檔案。所以
+`_shared/` 裡的東西要跟 script 一樣經過審查——它被每支 script 載入，
+出問題的影響面比單一 skill 大。
+
+**呼叫端無法偽造 `SKILL_ROOT`。** 它在環境變數封鎖清單裡，否則
+`env={"SKILL_ROOT": "/tmp/evil"}` 就能替換掉每支 script 都 source 的
+共用函式庫。有測試釘住這點。
 
 ## Shell script 的坑
 

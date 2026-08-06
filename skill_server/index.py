@@ -126,6 +126,9 @@ class SkillMeta:
     version: str | None
     directory: Path
     skill_md: Path
+    #: 這個 skill 所屬的 Skill Root。以 SKILL_ROOT 傳給 script，讓共用
+    #: 函式庫能被穩定引用——$SKILL_DIR/../ 在命名空間子目錄下會指錯層。
+    root: Path
     #: Byte offset where the markdown body starts (after the frontmatter block).
     body_offset: int
     mtime_ns: int
@@ -264,7 +267,7 @@ def _scan_bundle(directory: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(sorted(scripts)), tuple(sorted(others))
 
 
-def _load_meta(skill_md: Path) -> SkillMeta:
+def _load_meta(skill_md: Path, root: Path) -> SkillMeta:
     """Build a SkillMeta, or raise SkillRejected with a reason a human can act on."""
     try:
         stat = skill_md.stat()
@@ -337,6 +340,7 @@ def _load_meta(skill_md: Path) -> SkillMeta:
         version=str(version) if version is not None else None,
         directory=directory,
         skill_md=skill_md,
+        root=root,
         body_offset=body_offset,
         mtime_ns=stat.st_mtime_ns,
         size=stat.st_size,
@@ -365,10 +369,10 @@ class SkillIndex:
 
     # ---------------------------------------------------------------- scanning
 
-    def _discover(self) -> list[Path]:
+    def _discover(self) -> list[tuple[Path, Path]]:
         """Find every SKILL.md under the roots (one level of nesting, plus a
         namespace level so ``skills/<team>/<skill>/SKILL.md`` also works)."""
-        found: list[Path] = []
+        found: list[tuple[Path, Path]] = []
         for root in self.roots:
             if not root.is_dir():
                 logger.warning("skill root does not exist: %s", root)
@@ -378,14 +382,14 @@ class SkillIndex:
                     continue
                 candidate = Path(depth1.path) / SKILL_FILE
                 if candidate.is_file():
-                    found.append(candidate)
+                    found.append((candidate, root))
                     continue
                 for depth2 in os.scandir(depth1.path):
                     if not depth2.is_dir(follow_symlinks=True) or depth2.name.startswith("."):
                         continue
                     nested = Path(depth2.path) / SKILL_FILE
                     if nested.is_file():
-                        found.append(nested)
+                        found.append((nested, root))
         return found
 
     def refresh(self, *, force: bool = False) -> bool:
@@ -397,7 +401,7 @@ class SkillIndex:
         """
         skill_files = self._discover()
         stamps: dict[str, tuple[int, int]] = {}
-        for path in skill_files:
+        for path, _root in skill_files:
             try:
                 stat = path.stat()
             except OSError:
@@ -409,9 +413,9 @@ class SkillIndex:
 
         by_name: dict[str, SkillMeta] = {}
         rejected: list[dict[str, str]] = []
-        for path in skill_files:
+        for path, root in skill_files:
             try:
-                meta = _load_meta(path)
+                meta = _load_meta(path, root)
             except SkillRejected as exc:
                 # Surfaced rather than swallowed: a skill that silently fails to
                 # load is the hardest kind of problem to notice.

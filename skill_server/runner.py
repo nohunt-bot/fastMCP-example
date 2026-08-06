@@ -99,7 +99,7 @@ _CALLER_FORBIDDEN_ENV = frozenset({
     "PYTHONWARNINGS", "PYTHONINSPECT",
     "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
     "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB",
-    "SKILL_NAME", "SKILL_DIR", "SKILL_OUTPUT_BUDGET_BYTES",
+    "SKILL_NAME", "SKILL_DIR", "SKILL_ROOT", "SKILL_OUTPUT_BUDGET_BYTES",
 })
 #: Any variable starting with one of these is refused: the dynamic-linker
 #: families are the classic code-injection vector (LD_PRELOAD, DYLD_INSERT_LIBRARIES).
@@ -154,7 +154,10 @@ class ScriptResult:
         return asdict(self)
 
 
-def _child_env(skill_dir: Path, skill_name: str, *, pass_network_env: bool = True) -> dict[str, str]:
+def _child_env(
+    skill_dir: Path, skill_name: str, skill_root: Path | None = None,
+    *, pass_network_env: bool = True,
+) -> dict[str, str]:
     """A curated environment. Allowlist, not denylist."""
     keys = _BASE_ENV + (_NETWORK_ENV if pass_network_env else ())
     env = {k: os.environ[k] for k in keys if os.environ.get(k)}
@@ -167,6 +170,10 @@ def _child_env(skill_dir: Path, skill_name: str, *, pass_network_env: bool = Tru
             "PYTHONUNBUFFERED": "1",  # so we see output as it happens, not at exit
         }
     )
+    if skill_root is not None:
+        # 讓 script 能穩定引用共用函式庫：$SKILL_DIR/../ 在命名空間子目錄
+        # （skills/<team>/<skill>/）下會少算一層。
+        env["SKILL_ROOT"] = str(skill_root)
     return env
 
 
@@ -348,6 +355,7 @@ class ScriptRunner:
             cwd=meta.directory,
             skill=skill,
             script_label=str(target.relative_to(meta.directory.resolve())),
+            skill_root=meta.root,
             stdin=stdin,
             timeout=limit,
             stall_timeout=stall,
@@ -400,6 +408,7 @@ class ScriptRunner:
             cwd=cwd,
             skill=skill,
             script_label=label,
+            skill_root=None,
             stdin=stdin,
             timeout=timeout,
             stall_timeout=stall_timeout,
@@ -414,6 +423,7 @@ class ScriptRunner:
         cwd: Path,
         skill: str,
         script_label: str,
+        skill_root: Path | None,
         stdin: str | None,
         timeout: float,
         stall_timeout: float,
@@ -424,7 +434,8 @@ class ScriptRunner:
         stall = stall_timeout
         meta_directory = cwd
         child_env = _child_env(
-            meta_directory, skill, pass_network_env=self.pass_network_env
+            meta_directory, skill, skill_root,
+            pass_network_env=self.pass_network_env,
         )
         if self.output_budget_bytes:
             # A script that pages at the source beats one that dumps everything

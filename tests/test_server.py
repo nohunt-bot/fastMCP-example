@@ -2043,3 +2043,99 @@ def test_refresh_still_detects_content_and_structure_changes(tmp_path: Path):
     shutil.rmtree(second)
     assert index.refresh() is True, "刪除沒被偵測到"
     assert len(index) == 1
+
+
+# ================ 共用函式庫（skill 之間的程式碼重用）=======================
+
+
+def _shared_lib_tree(root: Path, *, namespaced: bool = False) -> Path:
+    """建立 skills/_shared/lib.sh 加一個 skill，可選擇放在命名空間子目錄下。"""
+    shared = root / "_shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    (shared / "lib.sh").write_text(
+        '#!/bin/bash\njson_error() { printf \'{"ok":false,"from":"shared"}\\n\'; }\n'
+    )
+    skill = (root / "finance" / "invoice-issue") if namespaced else (root / "invoice-issue")
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: invoice-issue\ndescription: 開立發票與折讓單的完整流程。當使用者需要開票時使用。\n---\n# 開票\n"
+    )
+    (skill / "scripts" / "run.sh").write_text(
+        '#!/bin/bash\nset -euo pipefail\nsource "$SKILL_ROOT/_shared/lib.sh"\njson_error\n'
+    )
+    return root
+
+
+def test_shared_directory_is_not_indexed_as_a_skill(tmp_path: Path):
+    """`_shared/` 沒有 SKILL.md，所以不該被當成 skill。
+
+    這是「重用發生在 script 層而非 skill 層」的前提：共用程式碼對模型
+    必須完全不可見，否則就變成要多付一次 load_skill 的成本。
+    """
+    index = SkillIndex([_shared_lib_tree(tmp_path)])
+    names = {card["name"] for card in index.catalog(limit=20)}
+    assert names == {"invoice-issue"}
+    assert index.stats()["rejected"] == [], "_shared 不該被當成壞掉的 skill 回報"
+
+
+@pytest.mark.parametrize("namespaced", [False, True])
+@pytest.mark.anyio
+async def test_skill_root_resolves_shared_lib_at_any_depth(tmp_path: Path, namespaced: bool):
+    """SKILL_ROOT 讓共用函式庫在任何目錄深度都能被引用。
+
+    迴歸重點：原本文件教的是 `$SKILL_DIR/../_shared/lib.sh`，但在命名空間
+    子目錄（skills/<team>/<skill>/）下 `../` 會少算一層，指到 skills/<team>/
+    而不是 skills/，source 直接失敗。
+    """
+    root = _shared_lib_tree(tmp_path, namespaced=namespaced)
+    result = await ScriptRunner(SkillIndex([root])).run(
+        "invoice-issue", "scripts/run.sh", timeout=30
+    )
+    assert result.status == "ok", result.stderr
+    assert json.loads(result.stdout)["from"] == "shared"
+
+
+@pytest.mark.anyio
+async def test_skill_root_is_exposed_and_points_at_the_owning_root(tmp_path: Path):
+    """多個 Skill Root 時，每個 skill 拿到的必須是自己所屬的那一個。"""
+    roots = []
+    for i in (0, 1):
+        root = tmp_path / f"root{i}"
+        skill = root / f"team{i}-task"
+        (skill / "scripts").mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            f"---\nname: team{i}-task\ndescription: 第 {i} 個根目錄下的技能，描述長度足夠。\n---\nx\n"
+        )
+        (skill / "scripts" / "show.sh").write_text('#!/bin/bash\nset -e\necho "$SKILL_ROOT"\n')
+        roots.append(root)
+
+    runner = ScriptRunner(SkillIndex(roots))
+    for i, root in enumerate(roots):
+        result = await runner.run(f"team{i}-task", "scripts/show.sh")
+        assert result.stdout.strip() == str(root.resolve()), (
+            f"team{i}-task 拿到的 SKILL_ROOT 不是自己所屬的根目錄"
+        )
+
+
+@pytest.mark.anyio
+async def test_caller_cannot_hijack_the_shared_library_via_skill_root(tmp_path: Path):
+    """曾經可行：呼叫端設 env={"SKILL_ROOT": 攻擊者目錄} 就能劫持共用函式庫。
+
+    加入 SKILL_ROOT 時漏了把它放進封鎖清單。共用函式庫被每支 script
+    source，劫持它等同於在每次呼叫時執行任意程式碼。
+    """
+    root = _shared_lib_tree(tmp_path / "real")
+    evil = tmp_path / "evil"
+    (evil / "_shared").mkdir(parents=True)
+    (evil / "_shared" / "lib.sh").write_text(
+        '#!/bin/bash\njson_error() { printf \'{"ok":false,"from":"PWNED"}\\n\'; }\n'
+    )
+
+    runner = ScriptRunner(SkillIndex([root]))
+    clean = await runner.run("invoice-issue", "scripts/run.sh", timeout=30)
+    assert json.loads(clean.stdout)["from"] == "shared"
+
+    with pytest.raises(ScriptError, match="SKILL_ROOT"):
+        await runner.run(
+            "invoice-issue", "scripts/run.sh", env={"SKILL_ROOT": str(evil)}, timeout=30
+        )
