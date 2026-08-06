@@ -2230,3 +2230,118 @@ def test_single_skill_never_triggers_similarity(tmp_path: Path):
         ("solo-skill", "查詢訂單資料。提供訂單的查詢功能與明細列表。"),
     ])))
     assert not [f for f in report["findings"] if f["rule"] == "LINT-040"]
+
+
+# ======================= 相容性檢查（spec.compat）===========================
+
+
+def _manifests(*entries) -> dict:
+    """(name, version, tags, scripts, timeout) -> compat 用的 manifest 結構。"""
+    out = {}
+    for name, version, tags, scripts, timeout in entries:
+        manifest = {"name": name, "description": f"{name} 的說明文字，長度足以通過檢查。",
+                    "_scripts": list(scripts)}
+        if version:
+            manifest["version"] = version
+        if tags:
+            manifest["tags"] = list(tags)
+        if timeout is not None:
+            manifest["execution"] = {"default": {"timeout": timeout}}
+        out[name] = manifest
+    return out
+
+
+def test_compat_classifies_every_change_type():
+    """每一類變更都要對應到 RFC-08 §14.2 的正確分類。"""
+    from spec.compat import BREAKING, MINOR, CompatReport, compare
+
+    base = _manifests(
+        ("kept", "1.0.0", ["a", "b"], ["scripts/x.sh", "scripts/y.sh"], 30),
+        ("removed", "1.0.0", [], [], None),
+    )
+    head = _manifests(
+        ("kept", "1.0.0", ["a"], ["scripts/x.sh", "scripts/z.sh"], 10),
+        ("added", "1.0.0", [], [], None),
+    )
+    report = CompatReport()
+    compare(base, head, report)
+    by_kind = {}
+    for change in report.changes:
+        by_kind.setdefault(change.kind, []).append(change.what)
+
+    breaking = " | ".join(by_kind[BREAKING])
+    assert "skill 被移除" in breaking
+    assert "移除 script scripts/y.sh" in breaking
+    assert "縮短為 10s" in breaking
+    assert "移除 tag" in breaking
+
+    minor = " | ".join(by_kind[MINOR])
+    assert "新增 skill" in minor
+    assert "新增 script scripts/z.sh" in minor
+
+
+def test_compat_fails_when_breaking_change_lacks_major_bump():
+    """工具唯一會讓 CI 失敗的判準：變更本身可不可接受由人決定，
+    但「破壞性變更卻沒 bump major」是客觀錯誤。"""
+    from spec.compat import CompatReport, check_versions, compare
+
+    base = _manifests(("svc", "1.2.0", ["x"], ["scripts/a.sh"], 60))
+    head = _manifests(("svc", "1.3.0", ["x"], ["scripts/a.sh"], 15))  # 縮短 timeout
+    report = CompatReport()
+    compare(base, head, report)
+    check_versions(base, head, report)
+
+    assert report.passed is False
+    assert "未提升 major" in report.version_problems[0]
+
+
+def test_compat_passes_when_major_is_bumped():
+    from spec.compat import CompatReport, check_versions, compare
+
+    base = _manifests(("svc", "1.2.0", ["x"], ["scripts/a.sh"], 60))
+    head = _manifests(("svc", "2.0.0", ["x"], ["scripts/a.sh"], 15))
+    report = CompatReport()
+    compare(base, head, report)
+    check_versions(base, head, report)
+
+    assert report.passed is True, report.version_problems
+    assert any(c.kind == "breaking" for c in report.changes), "變更仍要被回報"
+
+
+def test_compat_treats_minor_changes_as_compatible():
+    """放寬 timeout、新增 tag、改 description 都不是破壞性的。"""
+    from spec.compat import BREAKING, CompatReport, check_versions, compare
+
+    base = _manifests(("svc", "1.0.0", ["x"], ["scripts/a.sh"], 30))
+    head = _manifests(("svc", "1.1.0", ["x", "y"], ["scripts/a.sh"], 90))
+    head["svc"]["description"] = "改過的說明文字，同樣長度足以通過檢查規則。"
+    report = CompatReport()
+    compare(base, head, report)
+    check_versions(base, head, report)
+
+    assert report.passed is True
+    assert not [c for c in report.changes if c.kind == BREAKING]
+
+
+def test_compat_reads_base_from_git_without_checkout():
+    """base 版本必須從 git 讀進記憶體，不 checkout——服務與工具都不寫檔案。"""
+    from spec.compat import read_manifests_at
+
+    manifests = read_manifests_at("HEAD", "skills")
+    assert "api-call" in manifests
+    assert manifests["api-call"]["_scripts"] == ["scripts/call.sh"]
+
+
+@pytest.mark.anyio
+async def test_compat_reports_no_diff_against_itself():
+    """與自己比對必須是零差異，否則讀取路徑有 bug。"""
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "spec.compat", "--base=HEAD", "--head=HEAD", "--format=json"],
+        capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent,
+    )
+    report = json.loads(proc.stdout)
+    assert report["changes"] == []
+    assert report["passed"] is True
+    assert proc.returncode == 0

@@ -8,12 +8,19 @@ Built against FastMCP **3.4.6** / Python 3.12.
 
 ```bash
 uv sync
-uv run pytest -q                 # 139 tests
-uv run python acceptance.py      # 104 驗收項目，中文報告
+uv run pytest -q                 # 145 tests
+uv run python acceptance.py      # 110 驗收項目，中文報告
 uv run skill-mcp --port 8000 --context-tokens 30000
 ```
 
 Point a client at `http://127.0.0.1:8000/mcp`.
+
+**符合性等級：L2**（規範版本 1.0.0）— 所有 `MUST` 與 `SHOULD` 規則、
+完整 lint、真實攻擊的安全測試、相容性檢查皆通過。
+
+尚未宣告 L3 的唯一原因：RFC-059 要求 L3 的效能數字必須是實測而非推算，
+而 2,000 / 5,000 個 skill 規模的冷啟動時間目前是由 CPU 時間推估的
+（`docs/08-k8s-部署.md` 已標明）。在目標規模的容器裡實測一次即可補齊。
 
 **規範在 [`spec/`](spec/README.md)** — RFC-SKILL-1，可讓其他 MCP Skill
 服務套用。附可執行的驗證器：`uv run python -m spec.validate <skill 目錄>`。

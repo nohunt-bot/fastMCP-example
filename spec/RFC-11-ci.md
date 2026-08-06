@@ -28,7 +28,7 @@ graph LR
 | 2 | 引用 | 同上（VAL-022、VAL-050） | 任何 error | 60 s |
 | 3 | Lint | `spec.validate --level=L2` | 任何 warning | 60 s |
 | 4 | 安全 | `pytest -k "sec or traversal or symlink or env"` | 任何失敗 | 300 s |
-| 5 | 相容性 | 與基準版本比對 | 未標記的 breaking | 120 s |
+| 5 | 相容性 | `spec.compat --base=<ref>` | 未標記的 breaking | 120 s |
 | 6 | 文件 | 文件結構檢查 | 缺少必要小節 | 60 s |
 | 7 | 效能 | 受限容器量測 | 超過門檻 | 900 s |
 | 8 | 冒煙 | 啟動並打 `/ready` | 非 200 | 300 s |
@@ -62,7 +62,8 @@ jobs:
         run: uv run pytest -q -k "sec or traversal or symlink or env or caller"
 
       - name: 5 相容性
-        run: uv run python -m spec.compat --base=origin/main
+        run: uv run python -m spec.compat --base=origin/main --format=json
+             | tee reports/compat.json
 
       - name: 8 冒煙
         run: uv run python acceptance.py --smoke
@@ -81,6 +82,31 @@ jobs:
 ```
 
 **RFC-183** CI MUST 保存驗證報告為 artifact，MUST NOT 只輸出到日誌。
+
+### 相容性檢查的判準
+
+`spec.compat` 只回報**事實**（什麼變了、屬於 RFC-08 §14.2 的哪一類）；
+變更本身可不可接受由人決定。它唯一會讓 CI 失敗的情況是：
+
+> 發生了破壞性變更，但該 skill 的 `version` 沒有提升 major。
+
+**RFC-187** 破壞性變更 MUST 反映在版本號上。CI MUST 在未反映時失敗。
+
+**理由**：變更是否合理需要脈絡，工具無法判斷；但「破壞了相容性卻沒有
+標記」是客觀錯誤，且是最糟的失敗模式——呼叫端在下一次部署後突然壞掉，
+而沒有任何文件說過會壞。
+
+破壞性變更的偵測項目：
+
+| 偵測 | 分類 | 影響 |
+|---|---|---|
+| skill 被移除（含改名） | breaking | 呼叫端用舊名稱會失敗 |
+| 移除 script | breaking | 呼叫端可能正在使用 |
+| 縮短 `timeout` | breaking | 原本跑得完的呼叫開始逾時 |
+| 移除 tag | breaking | 依 tag 過濾的呼叫端找不到 |
+| 新增 skill / script / tag | minor | 純新增 |
+| 放寬 `timeout` | minor | 只會更寬鬆 |
+| 變更 `description` | minor | 不影響 API |
 
 ## 18.4 報告格式
 

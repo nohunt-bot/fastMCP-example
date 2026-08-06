@@ -66,7 +66,13 @@ uv run python -m spec.validate skills/ --recursive
 
 # 輸出機器可讀的報告
 uv run python -m spec.validate skills/ --format=json
+
+# 比對兩個版本，找出未標記的破壞性變更
+uv run python -m spec.compat --base=origin/main
 ```
+
+參考實作目前宣告 **L2**。未達 L3 的原因見專案 README——這是規範能約束
+提出它的專案的實例：條文說效能數字不得為推算，那就不能宣稱達標。
 
 ## RFC 2119 規範語言
 
