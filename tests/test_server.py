@@ -7,8 +7,12 @@ tool dispatch, validation and serialisation path without opening a socket.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import re
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -738,107 +742,16 @@ async def test_await_returns_bounded_and_not_finished_is_success(tmp_path: Path)
 # --------------------------------------------- fire-and-forget: the key ledger
 
 
-@pytest.mark.anyio
-async def test_state_dir_is_exposed_and_persists_between_calls(tmp_path: Path):
-    root = _make_skill(
-        tmp_path / "skills",
-        "stateful",
-        "touch.py",
-        "import os, pathlib\n"
-        "p = pathlib.Path(os.environ['SKILL_STATE_DIR']) / 'counter'\n"
-        "n = int(p.read_text()) + 1 if p.exists() else 1\n"
-        "p.write_text(str(n)); print(n)\n",
-    )
-    runner = ScriptRunner(SkillIndex([root]), state_root=tmp_path / "state")
-    assert (await runner.run("stateful", "scripts/touch.py")).stdout.strip() == "1"
-    assert (await runner.run("stateful", "scripts/touch.py")).stdout.strip() == "2"
 
 
-@pytest.mark.anyio
-async def test_state_dirs_are_isolated_per_skill(tmp_path: Path):
-    code = "import os; print(os.environ['SKILL_STATE_DIR'])"
-    root = _make_skill(tmp_path / "s", "alpha", "show.py", code)
-    _make_skill(tmp_path / "s", "beta", "show.py", code)
-    runner = ScriptRunner(SkillIndex([root]), state_root=tmp_path / "state")
-    a = (await runner.run("alpha", "scripts/show.py")).stdout.strip()
-    b = (await runner.run("beta", "scripts/show.py")).stdout.strip()
-    assert a != b and a.endswith("alpha") and b.endswith("beta")
 
 
-@pytest.mark.anyio
-async def test_submitted_keys_survive_in_the_ledger(tmp_path: Path):
-    """The failure this guards is not a lost job -- the job completes either way --
-    it is losing the only handle that can retrieve the result."""
-    import http.server
-    import json as _json
-    import threading
-    import uuid as _uuid
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            body = _json.dumps({"key": str(_uuid.uuid4()), "status": "accepted"}).encode()
-            self.send_response(202)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a):
-            pass
-
-    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    runner = ScriptRunner(SkillIndex([SKILLS]), state_root=tmp_path / "state")
-    url = f"http://127.0.0.1:{port}/api/jobs"
-
-    try:
-        submitted = []
-        for label in ("q3 report", "nightly rebuild"):
-            result = await runner.run(
-                "async-job", "scripts/job.py",
-                ["submit", url, "--body", '{"x":1}', "--label", label],
-                timeout=30,
-            )
-            assert result.status == "ok", result.stderr
-            payload = json.loads(result.stdout)
-            assert payload["key"] and payload["ledger"]
-            # submit must not block: the job runs to completion by design
-            assert result.duration_ms < 5_000
-            submitted.append((payload["key"], label))
-
-        listed = await runner.run("async-job", "scripts/job.py", ["list", "--limit", "10"])
-        jobs = json.loads(listed.stdout)["jobs"]
-        assert {j["key"] for j in jobs} == {k for k, _ in submitted}
-        assert {j["label"] for j in jobs} == {lbl for _, lbl in submitted}
-
-        # A label is what makes the ledger usable once the uuid means nothing.
-        found = await runner.run("async-job", "scripts/job.py", ["list", "--grep", "q3"])
-        matches = json.loads(found.stdout)["jobs"]
-        assert len(matches) == 1 and matches[0]["label"] == "q3 report"
-    finally:
-        server.shutdown()
 
 
-@pytest.mark.anyio
-async def test_ledger_is_append_only_under_concurrent_submits(tmp_path: Path):
-    """Two submits at once must not lose each other's key."""
-    root = _make_skill(
-        tmp_path / "skills",
-        "appender",
-        "add.py",
-        "import json, os, pathlib, sys\n"
-        "p = pathlib.Path(os.environ['SKILL_STATE_DIR']) / 'jobs.jsonl'\n"
-        "p.parent.mkdir(parents=True, exist_ok=True)\n"
-        "with p.open('a') as fh: fh.write(json.dumps({'key': sys.argv[1]}) + '\\n')\n"
-        "print(sys.argv[1])\n",
-    )
-    runner = ScriptRunner(SkillIndex([root]), state_root=tmp_path / "state")
-    await asyncio.gather(
-        *(runner.run("appender", "scripts/add.py", [f"key-{i}"]) for i in range(12))
-    )
-    lines = (tmp_path / "state" / "appender" / "jobs.jsonl").read_text().strip().splitlines()
-    assert {json.loads(l)["key"] for l in lines} == {f"key-{i}" for i in range(12)}
+
+
+
+
 
 
 # ============ 執行政策：只宣告 timeout，不宣告「意義」 ======================
@@ -1219,7 +1132,6 @@ def test_cli_parses_the_documented_flags():
         [
             "--skills", "/tmp/a",
             "--port", "9001",
-            "--state-dir", "/tmp/state",
             "--hooks-dir", "/tmp/hooks",
             "--context-tokens", "30000",
             "--script-stall-timeout", "10",
@@ -1227,7 +1139,6 @@ def test_cli_parses_the_documented_flags():
         ]
     )
     assert args.port == 9001
-    assert str(args.state_dir) == "/tmp/state"
     assert str(args.hooks_dir) == "/tmp/hooks"
     assert args.context_tokens == 30000
     assert args.script_stall_timeout == 10
@@ -1268,7 +1179,7 @@ async def test_hook_symlinked_outside_the_bundle_is_refused(tmp_path: Path):
 @pytest.mark.parametrize(
     "variable",
     ["PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "BASH_ENV",
-     "NODE_OPTIONS", "SKILL_STATE_DIR", "SKILL_DIR"],
+     "NODE_OPTIONS", "SKILL_NAME", "SKILL_DIR"],
 )
 @pytest.mark.anyio
 async def test_caller_cannot_set_execution_changing_env(tmp_path: Path, variable: str):
@@ -1426,3 +1337,465 @@ def test_hooks_are_not_listed_as_readable_content(tmp_path: Path):
     meta = SkillIndex([root]).get("hooked")
     assert meta.files == ("references/a.md",)
     assert meta.hooks == {"pre": "hooks/pre.py"}
+
+
+@pytest.mark.anyio
+async def test_timeout_holds_when_a_grandchild_keeps_the_pipe_open(tmp_path: Path):
+    """曾經違約：script 自己 0.05 秒就結束，但它 spawn 的孫行程繼承了 stdout，
+    pipe 因此沒有 EOF。runner 固定等 5 秒讀完 pipe，導致 timeout=2s 的呼叫
+    實際跑了 5 秒。
+
+    timeout 是對呼叫端的承諾，不能被孫行程延長。
+    """
+    skill = tmp_path / "forker"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: forker\ndescription: d\n---\nb\n")
+    (skill / "scripts" / "f.py").write_text(
+        "import subprocess, sys\n"
+        # 沒有導向 stdout：孫行程會一直握著我們的 pipe
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])\n"
+        "print('spawned', flush=True)\n"
+    )
+
+    started = time.monotonic()
+    result = await ScriptRunner(SkillIndex([tmp_path])).run(
+        "forker", "scripts/f.py", timeout=2, stall_timeout=0
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.5, f"timeout=2s 卻花了 {elapsed:.2f}s：孫行程把 pipe 撐開了"
+    assert "spawned" in result.stdout, "已印出的內容仍要保留"
+
+
+@pytest.mark.anyio
+async def test_a_detached_background_child_survives_and_returns_immediately(tmp_path: Path):
+    """把孫行程的輸出導開，script 就能立刻返回而孫行程繼續跑完。
+
+    這是「在 script 裡開背景工作」唯一可靠的寫法。不導開的話 runner 會被
+    pipe 卡住（見上一個測試）。
+    """
+    skill = tmp_path / "detached"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: detached\ndescription: d\n---\nb\n")
+    marker = tmp_path / "child-done.txt"
+    (skill / "scripts" / "f.py").write_text(
+        "import subprocess, sys\n"
+        "child = ('import time, pathlib, sys; time.sleep(1.5); '\n"
+        "         'pathlib.Path(sys.argv[1]).write_text(\"x\")')\n"
+        "subprocess.Popen([sys.executable, '-c', child, sys.argv[1]],\n"
+        "                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "print('dispatched', flush=True)\n"
+    )
+
+    result = await ScriptRunner(SkillIndex([tmp_path])).run(
+        "detached", "scripts/f.py", [str(marker)], timeout=10
+    )
+    assert result.status == "ok"
+    assert result.duration_ms < 1000, "導開輸出後應該立刻返回"
+    assert not marker.exists(), "此刻孫行程還在跑"
+
+    await asyncio.sleep(2.5)
+    assert marker.exists(), "孫行程必須活過 script 的結束"
+
+
+# ======================== 維運面：健康檢查、指標、關機 ======================
+
+
+@pytest.mark.anyio
+async def test_health_and_ready_endpoints_answer_plain_http(tmp_path: Path):
+    """k8s 的 probe 不會說 JSON-RPC，維運也需要能直接 curl。
+
+    迴歸重點：GET /mcp 回 405（MCP 端點只收 POST），所以把 readinessProbe
+    指向 /mcp 會讓 pod 永遠 NotReady。
+    """
+    from starlette.testclient import TestClient
+
+    root = _make_skill(tmp_path, "alive", "run.py", "print(1)")
+    app = build_server([root], refresh_interval=0).http_app()
+
+    with TestClient(app) as client:
+        # 實際狀態碼視 Accept header 而定（curl 得到 405，這裡 406），
+        # 但兩者都不是 2xx，httpGet probe 一律判定失敗。
+        assert not 200 <= client.get("/mcp").status_code < 300, "probe 不能指向 /mcp"
+
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["status"] == "ok"
+
+        ready = client.get("/ready")
+        assert ready.status_code == 200
+        assert ready.json()["skills"] == 1
+
+
+@pytest.mark.anyio
+async def test_ready_reports_503_when_no_skills_loaded(tmp_path: Path):
+    """空索引通常代表 --skills 路徑設錯。送流量進去比不送更糟：
+    模型會拿到空目錄，然後認定這些工具不存在。"""
+    from starlette.testclient import TestClient
+
+    empty = tmp_path / "nothing"
+    empty.mkdir()
+    app = build_server([empty], refresh_interval=0).http_app()
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200, "行程活著就該回 200"
+        ready = client.get("/ready")
+        assert ready.status_code == 503, "沒有 skill 就不該接流量"
+        assert ready.json()["skills"] == 0
+
+
+@pytest.mark.anyio
+async def test_metrics_endpoint_is_prometheus_readable(tmp_path: Path):
+    from starlette.testclient import TestClient
+
+    root = _make_skill(tmp_path, "counted", "run.py", "print(1)")
+    app = build_server([root], refresh_interval=0).http_app()
+
+    with TestClient(app) as client:
+        body = client.get("/metrics").text
+
+    assert "# TYPE skill_mcp_skills gauge" in body
+    assert "skill_mcp_skills 1" in body
+    for metric in ("skill_mcp_scripts_total", "skill_mcp_scripts_timeout_total",
+                   "skill_mcp_scripts_stalled_total"):
+        assert metric in body
+
+
+@pytest.mark.anyio
+async def test_drain_waits_for_in_flight_scripts(tmp_path: Path):
+    """滾動更新時，正在跑的 script 要有機會跑完。
+
+    否則一個已經送達 API、還沒印出 uuid 的 submit 會被 SIGKILL：
+    工作在後端跑到完成，handle 卻永遠消失。
+    """
+    root = _make_skill(
+        tmp_path, "slowish", "run.py",
+        "import time; time.sleep(0.8); print('finished', flush=True)",
+    )
+    runner = ScriptRunner(SkillIndex([root]))
+
+    task = asyncio.create_task(runner.run("slowish", "scripts/run.py", timeout=10))
+    await asyncio.sleep(0.2)
+    assert runner.in_flight == 1
+
+    started = time.monotonic()
+    remaining = await runner.drain(timeout=5)
+    assert remaining == 0, "drain 應該等到跑完"
+    assert time.monotonic() - started >= 0.3
+
+    result = await task
+    assert "finished" in result.stdout
+
+
+@pytest.mark.anyio
+async def test_drain_is_bounded_and_reports_abandoned(tmp_path: Path):
+    """k8s 只給 terminationGracePeriodSeconds，drain 不能無限等。"""
+    root = _make_skill(tmp_path, "verylong", "run.py", "import time; time.sleep(30)")
+    runner = ScriptRunner(SkillIndex([root]))
+
+    task = asyncio.create_task(runner.run("verylong", "scripts/run.py", timeout=60))
+    await asyncio.sleep(0.2)
+
+    started = time.monotonic()
+    remaining = await runner.drain(timeout=0.5)
+    elapsed = time.monotonic() - started
+
+    assert remaining == 1, "應如實回報還有幾支沒跑完"
+    assert elapsed < 2, "不能超出給定的 grace"
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+
+
+@pytest.mark.anyio
+async def test_catalog_respects_the_context_budget(tmp_path: Path):
+    """曾經的缺口：500 個 skill 的目錄約 23k tokens，等於 30k 視窗的 78%,
+    而 list_skills 是唯一沒有套預算的工具。"""
+    root = tmp_path / "many"
+    for i in range(300):
+        skill = root / f"skill-{i:04d}"
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            f"---\nname: skill-{i:04d}\ndescription: 這是第 {i} 個技能，"
+            f"用於處理某類內部業務流程與資料查詢。\n---\n內文\n"
+        )
+
+    async with Client(build_server([root], refresh_interval=0, context_tokens=30_000)) as client:
+        result = (await client.call_tool("list_skills", {"limit": 500})).data
+
+    payload = json.dumps(result, ensure_ascii=False)
+    assert result["total"] == 300, "總數要如實回報"
+    assert result["count"] < 300, "應該有被裁掉"
+    assert len(payload) // 3 < 30_000 * 0.2
+    assert "omitted" in result["truncated"]
+    assert "query" in result["truncated"]["hint"], "要指引模型縮小範圍，而不是加大 limit"
+
+
+# ==================== 無狀態：唯讀根檔案系統下必須能跑 ======================
+
+
+@pytest.mark.anyio
+async def test_no_state_dir_by_default(tmp_path: Path):
+    """服務不提供任何可寫目錄，也不寫任何檔案。
+
+    迴歸重點：曾經會建立 ~/.skill-mcp/state，在 --read-only 的容器裡
+    讓**每一支** script 都失敗。整個功能已移除，不是改預設值——
+    所有狀態都該留在後端 API。
+    """
+    root = _make_skill(
+        tmp_path, "stateless", "run.py",
+        "import os; print(os.environ.get('SKILL_STATE_DIR', 'NONE'))",
+    )
+    async with Client(build_server([root], refresh_interval=0)) as client:
+        result = (
+            await client.call_tool(
+                "run_skill_script", {"name": "stateless", "script": "scripts/run.py"}
+            )
+        ).data
+    assert result["stdout"].strip() == "NONE"
+    assert result["status"] == "ok"
+
+
+
+
+
+@pytest.mark.anyio
+async def test_runner_returns_as_soon_as_the_process_exits(tmp_path: Path):
+    """呼叫的耗時應該貼著 script 自己的執行時間，沒有額外等待。
+
+    注意語意：等的是「行程結束」，不是「stdout 關閉」——script 印完後若還留著
+    做別的事，整個呼叫都會被拖住。
+    """
+    root = tmp_path / "skills"
+    skill = root / "quick"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: quick\ndescription: d\n---\nb\n")
+    (skill / "scripts" / "instant.sh").write_text('#!/bin/bash\necho \'{"key":"abc"}\'\n')
+    # 印完關閉 stdout，但行程繼續活著
+    (skill / "scripts" / "lingers.sh").write_text(
+        '#!/bin/bash\necho \'{"key":"abc"}\'\nexec 1>&-\nsleep 1\n'
+    )
+
+    runner = ScriptRunner(SkillIndex([root]))
+    instant = await runner.run("quick", "scripts/instant.sh", timeout=20)
+    lingers = await runner.run("quick", "scripts/lingers.sh", timeout=20)
+
+    assert instant.status == "ok"
+    assert instant.duration_ms < 500, "印完就 exit 的 script 不該有額外延遲"
+    assert '"key":"abc"' in instant.stdout.replace(" ", "")
+
+    # 關閉 stdout 不會讓呼叫提早返回：runner 等的是行程
+    assert lingers.duration_ms >= 900, "行程還活著就必須繼續等"
+
+
+@pytest.mark.anyio
+async def test_api_call_skill_is_the_fast_path(tmp_path: Path):
+    """bash + curl 的 api-call 應該遠快於 Python 腳本。
+
+    在資源受限的環境下，直譯器啟動成本會主導整個呼叫。
+    """
+    import http.server
+    import json as _json
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = _json.dumps({"order_no": "SO-001", "status": "shipped"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        runner = ScriptRunner(SkillIndex([SKILLS]))
+        result = await runner.run(
+            "api-call", "scripts/call.sh",
+            ["GET", f"http://127.0.0.1:{port}/orders/SO-001"], timeout=30,
+        )
+    finally:
+        server.shutdown()
+
+    assert result.status == "ok", result.stderr
+    assert json.loads(result.stdout)["order_no"] == "SO-001", "回應要原樣輸出"
+    assert "GET http://127.0.0.1" in result.stderr, "進度要走 stderr"
+
+
+@pytest.mark.anyio
+async def test_api_call_reports_http_errors_without_raising(tmp_path: Path):
+    """非 2xx 要回報成資料，讓模型看得到狀態碼。"""
+    result = await ScriptRunner(SkillIndex([SKILLS])).run(
+        "api-call", "scripts/call.sh", ["GET", "http://127.0.0.1:1/nope"], timeout=30
+    )
+    assert result.status == "failed"
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error"] == "unreachable"
+
+
+def test_no_writable_state_api_exists_at_all():
+    """「不寫任何檔案」是契約，不是預設值。
+
+    這裡檢查的是整個功能不存在——不是「預設關閉」。任何人想加回一個可寫
+    目錄，都會撞到這條測試，必須先想清楚它在唯讀容器裡怎麼活。
+    """
+    import inspect
+
+    from skill_server import runner as runner_mod
+    from skill_server import server as server_mod
+
+    source = inspect.getsource(runner_mod) + inspect.getsource(server_mod)
+    for banned in ("SKILL_STATE_DIR", "state_root", "state_dir"):
+        assert banned not in source, f"{banned} 應該已完全移除"
+
+    signature = inspect.signature(ScriptRunner.__init__)
+    assert "state_root" not in signature.parameters
+    assert "--state-dir" not in inspect.getsource(server_mod)
+
+
+@pytest.mark.anyio
+async def test_server_creates_no_files_while_serving(tmp_path: Path):
+    """端對端：跑完一輪工具呼叫後，磁碟上不應該多出任何東西。
+
+    這是唯讀根檔案系統能成立的實際保證。
+    """
+    root = tmp_path / "skills"
+    _make_skill(root, "quiet", "run.py", "print('done')")
+
+    def snapshot() -> set[Path]:
+        return set(tmp_path.rglob("*"))
+
+    before = snapshot()
+    async with Client(build_server([root], refresh_interval=0)) as client:
+        await client.call_tool("list_skills", {})
+        await client.call_tool("load_skill", {"name": "quiet"})
+        result = (
+            await client.call_tool(
+                "run_skill_script", {"name": "quiet", "script": "scripts/run.py"}
+            )
+        ).data
+    assert result["status"] == "ok"
+
+    created = snapshot() - before
+    assert not created, f"服務不該建立任何檔案，卻多出：{created}"
+
+
+# =========================== 規範符合性（RFC-SKILL-1）=========================
+
+
+def _run_validator(target: str, extra: list[str] | None = None) -> dict:
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "spec.validate", target, "--format=json", *(extra or [])],
+        capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent,
+    )
+    return json.loads(proc.stdout)
+
+
+def test_all_skills_pass_spec_l1():
+    """本專案的 Skill 必須符合自己發布的規範。
+
+    規範若不能約束提出它的專案，就沒有理由要求其他團隊遵守。
+    """
+    report = _run_validator("skills/")
+    errors = [f for f in report["findings"] if f["severity"] == "error"]
+    assert not errors, "違反 L1：" + json.dumps(errors, ensure_ascii=False, indent=2)
+    assert report["passed"] is True
+
+
+def test_validator_detects_known_violations(tmp_path: Path):
+    """只會通過的驗證器沒有價值。
+
+    每個案例都對應附錄 A 的一則事故。
+    """
+    cases = {
+        "VAL-010": ("Bad_Name", "描述夠長可以通過長度檢查的測試用文字。", None),
+        "VAL-012": ("ok-name", None, None),
+        "VAL-013": ("ok-name", "長" * 1100, None),
+        "VAL-024": ("ok-name", "描述夠長可以通過長度檢查的測試用文字。",
+                    "execution:\n  scripts/a.sh:\n    mode: background\n"),
+    }
+    for expected, (name, desc, extra) in cases.items():
+        root = tmp_path / expected
+        skill = root / "s"
+        (skill / "scripts").mkdir(parents=True)
+        (skill / "scripts" / "a.sh").write_text("#!/bin/bash\nset -e\necho hi\n")
+        front = f"name: {name}\n"
+        if desc:
+            front += f"description: {desc}\n"
+        if extra:
+            front += extra
+        (skill / "SKILL.md").write_text(f"---\n{front}---\n內文\n")
+
+        report = _run_validator(str(root))
+        rules = {f["rule"] for f in report["findings"]}
+        assert expected in rules, f"未偵測到 {expected}，只找到 {rules}"
+        assert report["passed"] is False
+
+
+def test_validator_detects_security_violations(tmp_path: Path):
+    """安全規則必須真的抓得到 —— 對應附錄 A.1 的實際攻擊。"""
+    skill = tmp_path / "risky"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "references").mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: risky\ndescription: 描述夠長可以通過長度檢查的測試用文字。\n---\n內文\n"
+    )
+    (skill / "scripts" / "fetch.py").write_text('import requests\nrequests.get("http://x")\n')
+    (skill / "references" / "leak.txt").symlink_to("/etc/hosts")
+    (skill / "helper.py").write_text("print(1)\n")
+
+    report = _run_validator(str(tmp_path))
+    rules = {f["rule"] for f in report["findings"]}
+    assert {"SEC-001", "SEC-002", "SEC-010"} <= rules, f"只抓到 {rules}"
+
+
+def test_suppression_requires_a_reason(tmp_path: Path):
+    """RFC-055：豁免必須附理由，而且必須在報告中可見。"""
+    skill = tmp_path / "suppressed"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: suppressed\ndescription: 描述夠長可以通過長度檢查的測試用文字。\n---\n內文\n"
+    )
+    (skill / "scripts" / "a.sh").write_text(
+        "#!/bin/bash\n# spec:allow LINT-020 需自行處理離開碼\nset -uo pipefail\ncurl --max-time 5 http://x\n"
+    )
+    report = _run_validator(str(tmp_path))
+    findings = {f["rule"]: f["message"] for f in report["findings"]}
+    assert "LINT-030" in findings, "豁免必須產生可見的紀錄"
+    assert "需自行處理離開碼" in findings["LINT-030"], "理由必須出現在報告中"
+    assert "LINT-020" not in findings
+
+
+def test_validation_report_matches_schema():
+    """報告是 CI 的介面。格式錯誤會讓自動化靜默失效。"""
+    report = _run_validator("skills/")
+    schema = json.loads(
+        (Path(__file__).resolve().parent.parent
+         / "spec/schemas/validation-report.schema.json").read_text()
+    )
+    for key in schema["required"]:
+        assert key in report, f"報告缺少必要欄位 {key}"
+    assert set(report["summary"]) == {"error", "warning", "info"}
+    for finding in report["findings"]:
+        assert re.match(r"^(VAL|LINT|SEC|PERF)-\d{3}$", finding["rule"])
+        assert finding["severity"] in ("error", "warning", "info")
+
+
+def test_every_schema_is_valid_json():
+    """Schema 本身必須是合法 JSON 且宣告 Draft 2020-12。"""
+    schema_dir = Path(__file__).resolve().parent.parent / "spec/schemas"
+    files = sorted(schema_dir.glob("*.json"))
+    assert len(files) >= 5
+    for path in files:
+        doc = json.loads(path.read_text())
+        assert doc["$schema"] == "https://json-schema.org/draft/2020-12/schema", path.name
+        assert "$id" in doc, path.name

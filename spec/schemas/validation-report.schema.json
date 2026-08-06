@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.internal/mcp-skill/validation-report.schema.json",
+  "title": "驗證報告",
+  "description": "CI 與 linter 的機器可讀輸出。",
+  "type": "object",
+  "required": ["spec_version", "conformance_level", "passed", "findings", "summary"],
+  "properties": {
+    "spec_version": { "$ref": "common.schema.json#/$defs/semver" },
+    "conformance_level": { "$ref": "common.schema.json#/$defs/conformanceLevel" },
+    "passed": { "type": "boolean" },
+    "target": { "type": "string" },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "summary": {
+      "type": "object",
+      "required": ["error", "warning", "info"],
+      "properties": {
+        "error": { "type": "integer", "minimum": 0 },
+        "warning": { "type": "integer", "minimum": 0 },
+        "info": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": ["rule", "severity", "path", "message"],
+      "properties": {
+        "rule": { "type": "string", "pattern": "^(VAL|LINT|SEC|PERF)-[0-9]{3}$" },
+        "severity": { "$ref": "common.schema.json#/$defs/severity" },
+        "path": { "type": "string" },
+        "message": { "type": "string", "minLength": 1 },
+        "rfc": { "type": "string", "pattern": "^RFC-[0-9]{3}[a-z]?$" },
+        "autofixable": { "type": "boolean" },
+        "remediation": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

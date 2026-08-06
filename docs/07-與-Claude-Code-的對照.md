@@ -28,8 +28,8 @@
 | `hooks/` | 內部服務需要強制檢查點，不能靠模型自律 |
 | 卡住偵測 | script 呼叫 API 才有的問題 |
 | 輸出預算（`--context-tokens`） | Claude Code 面對的是大 context 模型；30k 的地端模型必須壓縮 |
-| `SKILL_STATE_DIR` | fire-and-forget 的 key 要活得比 context 久 |
 | `reload_skills` 工具 | Claude Code 是 CLI，每次啟動都重新掃描；這是常駐服務 |
+| `/health` `/ready` `/metrics` | 常駐服務需要 k8s 探針與指標 |
 
 ## Claude Code 有、這裡沒有
 

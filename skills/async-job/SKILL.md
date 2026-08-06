@@ -28,23 +28,14 @@ run_skill_script("async-job", "scripts/job.py",
 `submit` returns and the job keeps running. That is correct behaviour, not a
 race to be closed.
 
-## The real risk here is losing the key
+## 這裡沒有任何暫存
 
-The job will finish regardless. What breaks is the *retrieval*: a key that only
-ever existed in the model's context disappears the moment that context rolls,
-and the result then sits in the database with no way to address it. On a small
-context window this is a matter of minutes, not days.
+服務不寫檔案，所以 **uuid 只存在於 submit 的回應裡**，由呼叫端負責保管。
 
-So `submit` also appends the key to a ledger under `SKILL_STATE_DIR`, which
-survives across calls, sessions and restarts:
+要讓「回應遺失」不痛，正確的位置是你的 API：送出時帶一個由呼叫端產生的
+idempotency key，客戶端重送同一個 key 時回同一個 uuid，而不是建立第二個任務。
 
-```
-run_skill_script("async-job", "scripts/job.py", ["list", "--limit", "10"])
-run_skill_script("async-job", "scripts/job.py", ["list", "--grep", "q3"])
-```
-
-Always pass `--label` — it is what makes the ledger readable weeks later, when
-the uuid on its own tells you nothing.
+`--label` 只是把說明回顯在結果裡，方便閱讀，沒有被保存在任何地方。
 
 ## Deliberately not here
 
@@ -52,9 +43,9 @@ the uuid on its own tells you nothing.
   model loop, which is exactly what this design avoids.
 - **No cancellation.** Cancelling a partially-complete job is only safe if your
   backend says it is.
-- **`await` exists but is a last resort.** Bounded and heartbeating, for the
-  occasional case where you truly need the result in the same turn. On this
-  architecture, reach for `submit` + `fetch` instead.
+- **`await` 是最後手段。** 有界、會印心跳，只給「真的要同一輪拿到結果」的場合。
+  這個架構下優先用 `submit` + `fetch`。
+- **沒有 `list`。** 服務不記得你送出過什麼。
 
 ## Field names
 

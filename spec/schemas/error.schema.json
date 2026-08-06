@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.internal/mcp-skill/error.schema.json",
+  "title": "通用錯誤",
+  "type": "object",
+  "required": ["code", "category", "severity", "retryable", "user_message"],
+  "properties": {
+    "code": { "type": "string", "pattern": "^ERR-[0-9]{3}$" },
+    "category": {
+      "enum": ["validation", "not_found", "permission", "timeout", "upstream", "internal", "resource"]
+    },
+    "severity": { "$ref": "common.schema.json#/$defs/severity" },
+    "retryable": {
+      "type": "boolean",
+      "description": "ERR-模型：呼叫端據此決定是否重試。不可重試的錯誤重試只會浪費預算。"
+    },
+    "user_message": {
+      "type": "string",
+      "minLength": 1,
+      "description": "可安全回傳給呼叫端。不得含路徑、堆疊、機密。"
+    },
+    "internal_message": { "type": "string", "description": "僅供日誌，不得回傳給呼叫端。" },
+    "details": { "type": "object" },
+    "recovery": { "type": "string", "description": "可行動的下一步。" },
+    "http_status": { "type": "integer", "minimum": 100, "maximum": 599 }
+  },
+  "additionalProperties": false
+}
