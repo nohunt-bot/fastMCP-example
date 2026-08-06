@@ -85,7 +85,7 @@ print(json.dumps(out))
 
 ```python
 #!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import json, sys
 
 req = json.load(sys.stdin)
 result = req.get("result", {})
@@ -95,13 +95,9 @@ if req.get("mode") == "background" and result.get("status") == "ok" and not resu
     print(json.dumps({"reason": "背景任務沒有回傳 job key"}))
     sys.exit(1)
 
-if state := os.getenv("SKILL_STATE_DIR"):
-    line = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "script": req.get("script"),
-            "mode": req.get("mode"), "status": result.get("status"), "key": result.get("key")}
-    path = pathlib.Path(state) / "audit.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        fh.write(json.dumps(line) + "\n")
+# 稽核走 stderr → 容器日誌 → 你的日誌系統。
+# 不要寫本地檔案：服務跑在唯讀檔案系統上，而且 pod 掉了檔案也跟著沒。
+print(f"AUDIT script={req.get('script')} status={result.get('status')}", file=sys.stderr)
 
 result["audited"] = True
 print(json.dumps({"result": result}))

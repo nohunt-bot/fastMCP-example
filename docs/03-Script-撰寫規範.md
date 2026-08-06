@@ -130,7 +130,6 @@ if budget and len(text.encode()) > budget:
 |---|---|
 | `SKILL_NAME` | 目前 skill 的名稱 |
 | `SKILL_DIR` | skill 目錄的絕對路徑 |
-| `SKILL_STATE_DIR` | **可寫**且跨呼叫存活的目錄 |
 | `SKILL_OUTPUT_BUDGET_BYTES` | 建議的輸出上限 |
 | `HTTP_PROXY` 等 | 公司 proxy 與 TLS 設定（自動轉發） |
 
@@ -162,18 +161,75 @@ json.dump({"key": resp["key"], "status": "accepted"}, sys.stdout)
 **先印 key，再做其他事。** script 被砍掉時 uuid 若沒印出來，任務會跑完但沒有人
 能取回結果。
 
-如果要把 key 記在 ledger 裡（讓它活得比模型 context 久）：
+### script 不能寫任何檔案
 
-```python
-state = os.getenv("SKILL_STATE_DIR")
-if state:
-    path = pathlib.Path(state) / "jobs.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:              # append，不是讀取後覆寫
-        fh.write(json.dumps({"key": key, "label": label}) + "\n")
+服務跑在唯讀根檔案系統上，也不提供任何可寫目錄。這是刻意的：pod 掉了就掉了，
+沒有 volume 要準備，副本之間沒有狀態要同步。
+
+所以 **uuid 沒有地方可以暫存**。它只存在於這次呼叫的回應裡，由呼叫端負責保管。
+
+要讓「回應遺失」不痛，正確的位置是**你的 API**：
+
+- 送出時帶一個由呼叫端產生的 idempotency key
+- 客戶端沒收到回應時重送同一個 key，API 回同一個 uuid 而不是建立第二個任務
+
+只有你的 API 知道什麼算「同一個任務」，這件事沒辦法在 MCP 這一層補償。
+
+需要暫存檔時用 `$TMPDIR`（容器裡要另外掛 `emptyDir` 的 tmpfs），
+並且自己清乾淨——但先想清楚是不是真的需要。
+
+## 「在背景跑」到底是誰在背景跑
+
+這是最容易混淆的地方，先分清楚兩件事：
+
+### 情況 A：API server 端在背景跑（你要的通常是這個）
+
+```
+script POST → API handler 把工作丟進佇列，立刻 return uuid → script 收到就結束
+                                       ↑ 背景是在這裡發生的
 ```
 
-用 append 模式，這樣同時送出多個任務不會互相覆蓋。
+script 完全是同步的，它只是「很快就拿到回應」。**這不需要服務端做任何事**，
+也是最單純的做法。
+
+**關鍵是 handler 什麼時候 return，不是 return 什麼。** 實測兩個 handler，
+兩個都沒有回傳有意義的資料：
+
+| handler 寫法 | script 耗時 |
+|---|---|
+| 把工作丟進佇列後立刻 return | **0.04 秒** |
+| 宣告成 void，但同步把工作做完才 return | **5.07 秒** |
+
+HTTP 沒有「void」這回事——就算你的 handler 宣告成 `void`，HTTP 還是會回一個
+200 加空 body，script 還是會等到那一刻。所以：
+
+```csharp
+// 這不會在背景跑，script 會等到 LongWork() 做完
+[HttpPost] public void Run() { LongWork(); }
+
+// 這才會，script 幾十毫秒就拿到 uuid
+[HttpPost] public IActionResult Run() {
+    _queue.Enqueue(job);
+    return Accepted(new { key });
+}
+```
+
+### 情況 B：script 自己開背景行程（很少需要）
+
+如果真的要，**一定要把孫行程的輸出導開**：
+
+```python
+subprocess.Popen([sys.executable, "worker.py"],
+                 stdout=subprocess.DEVNULL,      # ← 必須
+                 stderr=subprocess.DEVNULL)
+print("已派工")                                   # script 立刻結束
+```
+
+不導開的話，孫行程會繼承 script 的 stdout pipe，pipe 一直不會 EOF，runner 會
+被卡住直到孫行程結束——你的 script 明明 0.05 秒就 return 了，這個呼叫卻要等
+到孫行程跑完。
+
+導開之後：script **0.04 秒返回**，孫行程繼續跑到完成。兩項都有測試釘住。
 
 ## Shell script 的坑
 
@@ -220,7 +276,8 @@ script 回傳非零離開碼時，服務會**回報**而不是拋例外：
 |---|---|
 | 一般 API 呼叫（timeout/重試/退避） | `skills/api-fetch/scripts/fetch.py` |
 | REST 查詢並在來源過濾 | `skills/rest-client/scripts/call.py` |
-| 背景任務送出／取回／ledger | `skills/async-job/scripts/job.py` |
+| 呼叫內部 API（**最快，bash**） | `skills/api-call/scripts/call.sh` |
+| 背景任務送出／取回 | `skills/async-job/scripts/job.py` |
 | 兩種模式並存 | `skills/internal-api/scripts/` |
 | 純資料處理（無網路） | `skills/csv-profile/scripts/profile.py` |
 | shell script | `skills/repo-digest/scripts/digest.sh` |

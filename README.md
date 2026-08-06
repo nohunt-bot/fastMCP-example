@@ -8,12 +8,15 @@ Built against FastMCP **3.4.6** / Python 3.12.
 
 ```bash
 uv sync
-uv run pytest -q                 # 92 tests
-uv run python acceptance.py      # 73 驗收項目，中文報告
+uv run pytest -q                 # 108 tests
+uv run python acceptance.py      # 89 驗收項目，中文報告
 uv run skill-mcp --port 8000 --context-tokens 30000
 ```
 
 Point a client at `http://127.0.0.1:8000/mcp`.
+
+**規範在 [`spec/`](spec/README.md)** — RFC-SKILL-1，可讓其他 MCP Skill
+服務套用。附可執行的驗證器：`uv run python -m spec.validate <skill 目錄>`。
 
 **中文文件在 [`docs/`](docs/README.md)** — 安裝部署、skill 撰寫、script 規範、
 hooks、驗收測試、疑難排解。`acceptance.py` 是給便宜/弱模型執行的驗收流程：中文
@@ -315,31 +318,21 @@ submit  ->  45 ms, returns the key, never waits
 fetch   ->  collect the result by key, possibly in a different session
 ```
 
-### The risk is losing the key, not losing the job
+### Nothing is remembered here
 
-The job completes either way. What breaks is *retrieval*: a key that only ever
-existed in the model's context vanishes when that context rolls — minutes, on a
-30 K window — and the result then sits in the database unaddressable.
+The server writes no files at all — no state directory, no ledger, nothing. The
+uuid exists only in the submit response, and the caller owns it from there.
 
-So `submit` also appends the key to an append-only ledger under
-`SKILL_STATE_DIR`, which survives calls, sessions and restarts:
-
-```
-["list", "--limit", "10"]     # what did I submit?
-["list", "--grep", "Q3"]      # find one by label
-```
-
-Always pass `--label`. Weeks later a uuid tells you nothing and a label tells
-you everything. Append-only (one JSON object per line) so concurrent submits
-cannot clobber each other — there's a test firing 12 at once.
-
-`--state-dir` sets the root (default `~/.skill-mcp/state`); each skill gets its
-own isolated subdirectory.
+To make a lost response harmless, the fix belongs in **your API**: accept a
+caller-generated idempotency key on submit, so a retry with the same key returns
+the same uuid instead of creating a second job. Only your API knows what counts
+as "the same job"; this cannot be compensated for at the MCP layer.
 
 ### Deliberately absent
 
 - **No waiting after submit.** That would put the long task back inside the
   model loop, which is the thing this design avoids.
+- **No `list`.** The server does not remember what you submitted.
 - **No cancellation.** Only your backend knows whether killing a half-finished
   job is safe.
 - **`await` exists but is a last resort** — bounded and heartbeating, for the
@@ -456,7 +449,8 @@ skills/
   repo-digest/   SKILL.md + scripts/digest.sh   (a non-Python script)
   api-fetch/     SKILL.md + scripts/fetch.py + references/hangs.md
   rest-client/   SKILL.md + scripts/call.py   (filters at the source)
-  async-job/     SKILL.md + scripts/job.py    (submit / fetch / key ledger)
+  api-call/      SKILL.md + scripts/call.sh   (bash+curl, the fast path)
+  async-job/     SKILL.md + scripts/job.py    (submit / fetch)
   internal-api/  two modes + hooks/pre.py + hooks/post.py
 bench.py       load generator
 tests/         69 tests: indexing, sandbox, hangs, modes, hooks, reload, budget, CLI
@@ -515,7 +509,6 @@ Resources mirror the read paths for clients that prefer attaching over calling:
 --max-script-concurrency  concurrent subprocesses (default 8)
 --script-timeout SEC      hard ceiling per script (default 30)
 --script-stall-timeout    kill a script silent for this long (default 20, 0 disables)
---state-dir DIR           writable per-skill state, exposed as SKILL_STATE_DIR
 --hooks-dir DIR           global pre.py / post.py applied to every skill
 --context-tokens N        client's context window; sizes all output (default 128000)
 --context-share F         max fraction of it one tool result may use (default 0.25)
