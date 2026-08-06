@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.internal/mcp-skill/manifest.schema.json",
+  "title": "Skill Manifest",
+  "description": "SKILL.md 的 YAML frontmatter。對應 RFC-02 第 4 章。",
+  "type": "object",
+  "required": ["description"],
+  "properties": {
+    "name": { "$ref": "common.schema.json#/$defs/skillName" },
+    "description": { "$ref": "common.schema.json#/$defs/description" },
+    "version": { "$ref": "common.schema.json#/$defs/semver" },
+    "tags": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/tag" },
+      "uniqueItems": true,
+      "maxItems": 16
+    },
+    "license": { "type": "string", "maxLength": 64 },
+    "allowed-tools": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+      "uniqueItems": true,
+      "description": "RFC-039。Server 透傳但不強制執行——它不擁有 Client 的工具清單。"
+    },
+    "execution": { "$ref": "#/$defs/execution" }
+  },
+  "patternProperties": {
+    "^x-": {
+      "description": "RFC-046。組織自訂擴充，必須以 x- 為前綴。"
+    }
+  },
+  "unevaluatedProperties": true,
+  "$comment": "RFC-045：未知屬性必須被忽略，不得導致拒絕，因此不使用 additionalProperties:false。",
+  "$defs": {
+    "execution": {
+      "type": "object",
+      "description": "RFC-036。只宣告 timeout，不宣告輸出語意。",
+      "properties": {
+        "default": { "$ref": "#/$defs/executionPolicy" }
+      },
+      "patternProperties": {
+        "^scripts/": { "$ref": "#/$defs/executionPolicy" }
+      },
+      "additionalProperties": false
+    },
+    "executionPolicy": {
+      "type": "object",
+      "properties": {
+        "timeout": { "$ref": "common.schema.json#/$defs/timeoutSeconds" },
+        "stall_timeout": { "$ref": "common.schema.json#/$defs/stallTimeoutSeconds" },
+        "description": { "type": "string", "maxLength": 256 }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["mode"] },
+          { "required": ["key_field"] },
+          { "required": ["key_fields"] }
+        ]
+      },
+      "$comment": "RFC-036：禁止宣告輸出語意。mode/key_field 是已移除的設計。",
+      "additionalProperties": false
+    }
+  }
+}

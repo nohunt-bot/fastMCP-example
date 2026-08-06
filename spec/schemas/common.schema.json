@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.internal/mcp-skill/common.schema.json",
+  "title": "共用型別定義",
+  "description": "所有其他 schema 透過 $ref 引用此檔，避免重複定義。",
+  "$defs": {
+    "skillName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "RFC-031。小寫字母、數字、連字號。同時是查詢鍵與可能的路徑組成，因此強制檢查。",
+      "examples": ["order-lookup", "csv-profile"]
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "RFC-034。唯一每次對話都載入的文字，也是模型的路由依據。"
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
+      "description": "LINT-001。Semantic Versioning 2.0.0。"
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "maxLength": 32
+    },
+    "scriptPath": {
+      "type": "string",
+      "pattern": "^scripts/[A-Za-z0-9_.-]+\\.(sh|py|js)$",
+      "description": "RFC-022 + RFC-023。只有 scripts/ 下、白名單副檔名的檔案可執行。"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$",
+      "description": "RFC-028。相對路徑，不得含 .. 或以 / 開頭。"
+    },
+    "timeoutSeconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 900,
+      "description": "RFC-037。wall-clock 上限，由 Server 鉗制。"
+    },
+    "stallTimeoutSeconds": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 600,
+      "description": "靜默判定秒數。0 停用。"
+    },
+    "severity": {
+      "enum": ["error", "warning", "info"],
+      "description": "驗證發現的嚴重度。error 阻擋載入。"
+    },
+    "scriptStatus": {
+      "enum": ["ok", "failed", "timeout", "stalled"],
+      "description": "RFC-009。優先於 exit_code：被終止的行程沒有有意義的離開碼。"
+    },
+    "conformanceLevel": {
+      "enum": ["L1", "L2", "L3"]
+    }
+  }
+}

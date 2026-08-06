@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.internal/mcp-skill/script-result.schema.json",
+  "title": "run_skill_script 的回應",
+  "type": "object",
+  "required": ["skill", "script", "status", "stdout", "stderr", "duration_ms", "output"],
+  "properties": {
+    "skill": { "$ref": "common.schema.json#/$defs/skillName" },
+    "script": { "type": "string" },
+    "status": { "$ref": "common.schema.json#/$defs/scriptStatus" },
+    "exit_code": { "type": ["integer", "null"] },
+    "stdout": {
+      "type": "string",
+      "description": "RFC-009。即使被終止也必須包含終止前的輸出。Server 不解讀其語意。"
+    },
+    "stderr": { "type": "string" },
+    "duration_ms": { "type": "number", "minimum": 0 },
+    "timed_out": { "type": "boolean" },
+    "stalled": { "type": "boolean" },
+    "truncated": { "type": "boolean" },
+    "silent_for_s": { "type": ["number", "null"] },
+    "hint": {
+      "type": ["string", "null"],
+      "description": "RFC-047。status 為 timeout/stalled 時必須存在且可行動。"
+    },
+    "output": { "$ref": "#/$defs/shapeInfo" },
+    "hook_notes": { "type": "array", "items": { "type": "string" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "enum": ["timeout", "stalled"] } } },
+      "then": {
+        "required": ["hint", "silent_for_s"],
+        "properties": { "hint": { "type": "string", "minLength": 20 } },
+        "$comment": "RFC-047：終止必須附帶可行動的診斷，不能只說『逾時』。"
+      }
+    }
+  ],
+  "$defs": {
+    "shapeInfo": {
+      "type": "object",
+      "required": ["shaped", "approx_tokens"],
+      "properties": {
+        "shaped": { "type": "boolean" },
+        "how": { "enum": ["json-structural", "json-outline-only", "text-head-tail"] },
+        "approx_tokens": { "type": "integer", "minimum": 0 },
+        "original_approx_tokens": { "type": "integer", "minimum": 0 },
+        "original_bytes": { "type": "integer", "minimum": 0 },
+        "dropped": { "type": ["object", "null"] },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "dropped_bytes": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
