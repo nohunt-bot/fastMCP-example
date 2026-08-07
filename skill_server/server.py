@@ -217,10 +217,23 @@ def build_server(
     async def list_skills(
         query: Annotated[
             str | None,
-            Field(description="Optional free-text filter over name, tags and description."),
+            Field(
+                description="Optional free-text filter over name, tags and description.",
+                # RFC-03 §7.3 documents this exact bound. Without it a
+                # multi-MB paste reaches search.tokenize(), which emits a
+                # unigram *and* a bigram per CJK character -- unbounded input
+                # in, unbounded work out.
+                max_length=256,
+            ),
         ] = None,
         tags: Annotated[
-            list[str] | None, Field(description="Only skills carrying all of these tags.")
+            list[Annotated[str, Field(max_length=32)]] | None,
+            Field(
+                description="Only skills carrying all of these tags.",
+                # A skill can declare at most 16 tags (manifest.schema.json);
+                # filtering on more than that can never match anything.
+                max_length=16,
+            ),
         ] = None,
         limit: Annotated[int, Field(ge=1, le=500)] = 50,
     ) -> dict[str, Any]:
@@ -235,11 +248,21 @@ def build_server(
         def size(payload: Any) -> int:
             return len(json.dumps(payload, ensure_ascii=False).encode())
 
+        # Bind one snapshot for the whole call. Below this point we make up
+        # to five index reads (catalog, facets, sample_per_facet, count x2);
+        # without a shared snapshot each one would read self._snapshot fresh,
+        # and a reload_skills landing midway could make `total` disagree with
+        # the sum of `facets`, or hand back a sampled skill that catalog()
+        # (reading the *next* generation) no longer has. See
+        # SkillIndex.snapshot().
+        snap = index.snapshot()
+
         # 無篩選時以**完整目錄**判斷，不能用 limit 截斷後的結果——預設
         # limit=50 會讓它永遠看似放得下，總覽就再也不會啟用。
         cards = index.catalog(
             query=query, tags=tags,
-            limit=len(index) if not query and not tags else limit,
+            limit=index.count(snap) if not query and not tags else limit,
+            snap=snap,
         )
 
         # 沒有篩選條件、而且完整目錄放不下時，改回傳「領域總覽」而不是
@@ -249,18 +272,19 @@ def build_server(
         # 看得到字母序前 6 個領域，另外 15 個完全不知道存在——而且它沒有
         # 辦法發現自己漏了什麼。總覽用差不多的 token 數涵蓋全部領域。
         if not query and not tags and size(cards) > budget:
-            facets = index.facets()
-            samples = index.sample_per_facet(per=1, limit=40)
+            facets = index.facets(snap)
+            samples = index.sample_per_facet(per=1, limit=40, snap=snap)
             while samples and size(samples) > budget // 2:
                 samples.pop()
+            total = index.count(snap)
             return {
                 "count": len(samples),
-                "total": len(index),
+                "total": total,
                 "view": "overview",
                 "facets": facets,
                 "skills": samples,
                 "hint": (
-                    f"目錄有 {len(index)} 個 skill，放不進 context，因此改為領域"
+                    f"目錄有 {total} 個 skill，放不進 context，因此改為領域"
                     f"總覽：facets 是「領域 -> 數量」，skills 是每個領域的一個代表。"
                     f"用 tags=['<領域>'] 或 query='<關鍵字>' 取得該領域的完整清單。"
                 ),
@@ -273,7 +297,7 @@ def build_server(
             dropped += 1
 
         result: dict[str, Any] = {
-            "count": len(cards), "total": len(index), "view": "list", "skills": cards,
+            "count": len(cards), "total": index.count(snap), "view": "list", "skills": cards,
         }
         if dropped:
             result["truncated"] = {
@@ -287,10 +311,25 @@ def build_server(
 
     @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
     async def load_skill(
-        name: Annotated[str, Field(description="Exact skill name from list_skills.")],
+        name: Annotated[
+            str,
+            Field(
+                description="Exact skill name from list_skills.",
+                # Matches common.schema.json's skillName bound. Also stops a
+                # pathological name from turning index.get()'s did-you-mean
+                # scan (index.py, substring match against every skill name)
+                # into O(chars-in-name x skills) work on a lookup miss.
+                max_length=64,
+            ),
+        ],
         section: Annotated[
             str | None,
-            Field(description="Load only this markdown heading's section, e.g. 'Usage'."),
+            Field(
+                description="Load only this markdown heading's section, e.g. 'Usage'.",
+                # Not spec-documented; a real markdown heading is at most a
+                # line, so this is generous headroom rather than a tight fit.
+                max_length=200,
+            ),
         ] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -300,36 +339,131 @@ def build_server(
         that heading's content instead of the whole document.
         """
         try:
-            meta = index.get(name)
-            body = await asyncio.to_thread(index.body, name)
+            # One snapshot for both reads: `get()` and `body()` are two calls,
+            # and `body()` hops to a worker thread and back, a real await
+            # point a concurrent reload_skills can land in. Without a shared
+            # snapshot, `meta` could describe generation N (e.g. its
+            # `scripts` list) while `body` is read from generation N+1 --
+            # metadata and content from two different edits stitched into one
+            # response. See SkillIndex.snapshot().
+            snap = index.snapshot()
+            meta = index.get(name, snap)
+            body = await asyncio.to_thread(index.body, name, snap)
         except SkillLoadError as exc:
             raise ToolError(str(exc)) from exc
+        except OSError as exc:
+            # TOCTOU: the file existed at the snapshot lookup but the read in
+            # index.body() lost the race (removed, permissions changed).
+            # Every other error path here is sanitised (SkillLoadError never
+            # carries an absolute path); a raw FileNotFoundError would break
+            # that -- its message embeds the container's absolute path.
+            raise ToolError(
+                f"skill {name!r} could not be read: {exc.strerror or exc}"
+            ) from exc
 
         if section:
             body = _extract_section(body, section)
         body, body_shape = shaping.shape(body, output_budget_bytes)
+
+        # shaping.shape() only ever bounds `body`. The response also carries
+        # `scripts` and `files` -- up to 2 x _MAX_BUNDLE_ENTRIES path strings
+        # between them -- which no budget covered until now, so a
+        # bundle-heavy skill could blow the context window even with a
+        # perfectly shaped body. Trim those lists, cheapest entries first,
+        # until the *whole* response fits -- matching list_skills, which
+        # already measures the full serialised payload rather than just one
+        # field of it.
+        scripts = list(meta.scripts)
+        files = list(meta.files)
+
+        def envelope() -> dict[str, Any]:
+            return {
+                "name": meta.name,
+                "output": body_shape,
+                "allowed_tools": list(meta.allowed_tools),
+                "description": meta.description,
+                "version": meta.version,
+                "tags": list(meta.tags),
+                "body": body,
+                "scripts": scripts,
+                "files": files,
+            }
+
+        def size(payload: Any) -> int:
+            return len(json.dumps(payload, ensure_ascii=False).encode())
+
+        dropped_scripts = dropped_files = 0
+        overage = size(envelope()) - output_budget_bytes
+        if overage > 0:
+            # `body` alone can be tens of KB; re-serialising the *whole*
+            # envelope once per dropped entry (up to 2 x _MAX_BUNDLE_ENTRIES)
+            # would repeat body's escape-scan hundreds of times over -- the
+            # same "large payload in a loop" cost defect 3 avoids in
+            # shaping.shape(). Each entry is just a short path string, so
+            # size it on its own (cheap) and use that to decide how many to
+            # drop, instead of re-measuring the envelope every time.
+            #
+            # Files go first: they are read on demand via read_skill_file,
+            # while run_skill_script needs a script's exact path to call it
+            # at all, so scripts survive longer into the trim.
+            for bucket, is_files in ((files, True), (scripts, False)):
+                while bucket and overage > 0:
+                    removed = bucket.pop()
+                    overage -= len(json.dumps(removed, ensure_ascii=False).encode()) + 1
+                    if is_files:
+                        dropped_files += 1
+                    else:
+                        dropped_scripts += 1
+
+        result = envelope()
+        # The per-entry estimate above can be a few bytes off (it does not
+        # account for the envelope's own key/comma bookkeeping); close any
+        # remaining gap with the exact measure. Bounded by that estimation
+        # slack, not by bundle size, so this is at most a couple of passes.
+        while size(result) > output_budget_bytes and (files or scripts):
+            if files:
+                files.pop()
+                dropped_files += 1
+            else:
+                scripts.pop()
+                dropped_scripts += 1
+            result = envelope()
+
+        if dropped_scripts or dropped_files:
+            # The model must never silently believe it has seen the full
+            # bundle -- same principle as list_skills' `truncated` field.
+            body_shape = {
+                **body_shape,
+                "shaped": True,
+                "bundle_truncated": {
+                    "scripts_omitted": dropped_scripts,
+                    "files_omitted": dropped_files,
+                    "hint": "scripts/files was cut to fit the context budget; the "
+                    "omitted entries are invisible to you. Narrow `section`, or "
+                    "call read_skill_file / run_skill_script with a path you "
+                    "already have another way, rather than assuming this list "
+                    "is complete.",
+                },
+            }
+            result["output"] = body_shape
+
         if ctx is not None:
             await ctx.debug(f"loaded skill {name!r} ({len(body)} chars)")
-
-        return {
-            "name": meta.name,
-            "output": body_shape,
-            "allowed_tools": list(meta.allowed_tools),
-            "description": meta.description,
-            "version": meta.version,
-            "tags": list(meta.tags),
-            "body": body,
-            "scripts": list(meta.scripts),
-            "files": list(meta.files),
-        }
+        return result
 
     # ---------------------------------------------------------------- level 3
 
     @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
     async def read_skill_file(
-        name: Annotated[str, Field(description="Skill that owns the file.")],
+        name: Annotated[str, Field(description="Skill that owns the file.", max_length=64)],
         path: Annotated[
-            str, Field(description="Path relative to the skill directory, e.g. 'references/api.md'.")
+            str,
+            Field(
+                description="Path relative to the skill directory, e.g. 'references/api.md'.",
+                # Not spec-documented; generous enough for any real bundle
+                # path, tight enough to refuse a multi-MB paste.
+                max_length=1024,
+            ),
         ],
         max_bytes: Annotated[int, Field(ge=1, le=MAX_FILE_BYTES)] = 64 * 1024,
     ) -> dict[str, Any]:
@@ -348,19 +482,53 @@ def build_server(
                 raw = fh.read(max_bytes)
             return raw.decode("utf-8", "replace"), size > max_bytes, size
 
-        content, truncated, size = await asyncio.to_thread(_read)
+        try:
+            content, truncated, size_bytes = await asyncio.to_thread(_read)
+        except OSError as exc:
+            # TOCTOU: resolve_file() confirmed the file existed; it can still
+            # vanish (or become unreadable) before this thread hop gets to
+            # read it. Sanitised like every other error path here -- a raw
+            # FileNotFoundError would carry the container's absolute path.
+            raise ToolError(
+                f"file for skill {name!r} could not be read: {exc.strerror or exc}"
+            ) from exc
         # Same context budget as script output. A 400 KB reference file is
         # ~114k tokens: on a 30k model that is unusable, and it arrives looking
         # like a successful read rather than an error.
         content, shape_info = shaping.shape(content, output_budget_bytes)
-        return {
-            "skill": name,
-            "path": path,
-            "bytes": size,
-            "truncated": truncated or shape_info.get("shaped", False),
-            "output": shape_info,
-            "content": content,
-        }
+
+        def envelope() -> dict[str, Any]:
+            return {
+                "skill": name,
+                "path": path,
+                "bytes": size_bytes,
+                "truncated": truncated or shape_info.get("shaped", False),
+                "output": shape_info,
+                "content": content,
+            }
+
+        def size(payload: Any) -> int:
+            return len(json.dumps(payload, ensure_ascii=False).encode())
+
+        # shaping.shape() only bounds `content`; `skill`/`path` ride along
+        # unbounded by that budget (both are now capped by the Fields above,
+        # so the overhead is small and fixed, unlike load_skill's
+        # scripts/files lists -- but a `content` shaped right up to the edge
+        # can still tip the *whole* response over once that overhead lands).
+        # A couple of corrective passes closes the gap; each one reshapes
+        # the already-shaped (budget-sized) `content`, never the original
+        # file, so this stays cheap regardless of how large the file was.
+        result = envelope()
+        for _ in range(3):
+            over = size(result) - output_budget_bytes
+            if over <= 0:
+                break
+            content, shape_info = shaping.shape(
+                content, max(len(content.encode("utf-8")) - over, 0)
+            )
+            truncated = True
+            result = envelope()
+        return result
 
     # ---------------------------------------------------------------- level 4
 

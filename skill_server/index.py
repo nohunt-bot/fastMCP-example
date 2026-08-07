@@ -267,13 +267,37 @@ def _scan_bundle(directory: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(sorted(scripts)), tuple(sorted(others))
 
 
+def _short_path(path: Path, root: Path) -> str:
+    """``path`` relative to its skill root, or just the filename if that fails.
+
+    Used anywhere ``skill_server_stats()`` surfaces a path. Unlike /health,
+    /ready and /metrics -- plain HTTP, reachable only by whoever operates the
+    pod -- stats is an MCP *tool*, so the model itself can call it and relay
+    whatever it returns onward. The container's absolute filesystem layout
+    (which, in local dev, includes the operator's username) is not
+    information the model needs to debug a rejected skill; the skill's own
+    relative location is. Full detail still reaches the server log (see
+    refresh(), below) for whoever actually has cluster or host access.
+    """
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return path.name
+
+
 def _load_meta(skill_md: Path, root: Path) -> SkillMeta:
     """Build a SkillMeta, or raise SkillRejected with a reason a human can act on."""
     try:
         stat = skill_md.stat()
         front, body_offset = _parse_frontmatter(skill_md)
     except OSError as exc:
-        raise SkillRejected(skill_md.parent.name, skill_md, f"unreadable: {exc}") from exc
+        # exc.strerror only ("Permission denied", "No such file or
+        # directory"), not str(exc) -- the latter embeds the absolute path,
+        # and this reason ends up in skill_server_stats(), an MCP tool the
+        # model itself can call (see _short_path below for the same call).
+        raise SkillRejected(
+            skill_md.parent.name, skill_md, f"unreadable: {exc.strerror or exc}"
+        ) from exc
 
     directory = skill_md.parent
     name = str(front.get("name") or directory.name).strip()
@@ -418,9 +442,12 @@ class SkillIndex:
                 meta = _load_meta(path, root)
             except SkillRejected as exc:
                 # Surfaced rather than swallowed: a skill that silently fails to
-                # load is the hardest kind of problem to notice.
+                # load is the hardest kind of problem to notice. Full absolute
+                # path in the log (operator-only); redacted in the snapshot,
+                # which skill_server_stats() -- an MCP tool -- exposes to the
+                # model (see _short_path).
                 logger.warning("rejected %s: %s", exc.path, exc.reason)
-                rejected.append({"path": str(exc.path), "reason": exc.reason})
+                rejected.append({"path": _short_path(exc.path, root), "reason": exc.reason})
                 continue
             if meta.name in by_name:
                 logger.warning(
@@ -465,8 +492,38 @@ class SkillIndex:
     def generation(self) -> int:
         return self._snapshot.generation
 
+    def snapshot(self) -> "_Snapshot":
+        """Bind and return the current generation, once.
+
+        Every read method below already binds ``self._snapshot`` to a local
+        before it starts, so *within* one call it can never observe a torn
+        state — a swap mid-method is impossible because nothing here awaits.
+        But a tool handler that makes several of these calls to answer one
+        request (``load_skill``'s meta-then-body; ``list_skills``'s
+        catalog/facets/sample-per-facet/count) is not a single method, and
+        the calls are not adjacent: `load_skill` awaits a thread hop between
+        them, and even a purely synchronous handler shares the GIL with
+        whatever thread a concurrent `reload_skills` runs its rebuild on. A
+        swap landing between two calls in the same handler then answers with
+        metadata from one generation and data from another -- e.g. a
+        `scripts` list from before an edit paired with a body from after,
+        so a follow-up `run_skill_script` against a script that list named
+        fails. Call this once at the top of such an operation and thread the
+        result into every index call it makes (``get``, ``body``,
+        ``catalog``, ``facets``, ``sample_per_facet``, ``count``) so the
+        whole operation reads as one generation, exactly like a single method
+        already does.
+        """
+        return self._snapshot
+
+    def count(self, snap: "_Snapshot | None" = None) -> int:
+        """Skill count in ``snap`` (or the live snapshot). See ``snapshot()``:
+        a composed operation should pass its own bound snapshot here rather
+        than let this re-read ``self._snapshot``, which may have moved on."""
+        return len((snap or self._snapshot).by_name)
+
     def __len__(self) -> int:
-        return len(self._snapshot.by_name)
+        return self.count()
 
     def facets(self, snap: "_Snapshot | None" = None) -> dict[str, int]:
         """領域 -> skill 數。用於目錄放不下時的總覽。
@@ -489,9 +546,13 @@ class SkillIndex:
         query: str | None = None,
         tags: Iterable[str] | None = None,
         limit: int = 50,
+        snap: "_Snapshot | None" = None,
     ) -> list[dict[str, Any]]:
         """Filtered skill cards. Zero I/O — pure in-memory."""
-        snap = self._snapshot  # bind once: immune to a concurrent swap
+        # Bind once: immune to a concurrent swap within this call. Pass your
+        # own `snap` (from `snapshot()`) when this is one of several calls
+        # composing a single logical operation -- see `snapshot()`.
+        snap = snap or self._snapshot
         if not query and not tags:
             return list(snap.catalog[:limit])
 
@@ -523,13 +584,18 @@ class SkillIndex:
         scored.sort(key=lambda row: (row[0], row[1]))
         return [card for _, _, card in scored[:limit]]
 
-    def sample_per_facet(self, per: int = 1, limit: int = 40) -> list[dict[str, Any]]:
+    def sample_per_facet(
+        self, per: int = 1, limit: int = 40, snap: "_Snapshot | None" = None
+    ) -> list[dict[str, Any]]:
         """每個領域取幾個代表。
 
         目的是讓模型知道「每個領域的 skill 長什麼樣」，而不是只拿到
         字母序前 N 個——後者會讓整個領域對模型隱形。
+
+        接受外部傳入的 `snap`（來自 `snapshot()`），讓呼叫端能與同一次
+        操作裡的其他呼叫（catalog、facets、count）綁在同一個世代上。
         """
-        snap = self._snapshot
+        snap = snap or self._snapshot
         buckets: dict[str, list[SkillMeta]] = {}
         for meta in sorted(snap.by_name.values(), key=lambda m: m.name):
             key = (meta.tags or (meta.name.split("-")[0],))[0]
@@ -543,20 +609,29 @@ class SkillIndex:
                     return out
         return out
 
-    def get(self, name: str) -> SkillMeta:
-        meta = self._snapshot.by_name.get(name)
+    def get(self, name: str, snap: "_Snapshot | None" = None) -> SkillMeta:
+        # See `snapshot()`. Pass a bound `snap` when this `get()` is one of
+        # several calls (e.g. followed by `body()`) that must all see the
+        # same generation.
+        snap = snap or self._snapshot
+        meta = snap.by_name.get(name)
         if meta is None:
-            close = [n for n in self._snapshot.by_name if name.lower() in n.lower()][:5]
+            close = [n for n in snap.by_name if name.lower() in n.lower()][:5]
             hint = f" Did you mean: {', '.join(close)}?" if close else ""
             raise SkillLoadError(f"unknown skill {name!r}.{hint} Call list_skills first.")
         return meta
 
-    def body(self, name: str) -> str:
+    def body(self, name: str, snap: "_Snapshot | None" = None) -> str:
         """Skill body (frontmatter stripped), cached and mtime-validated.
 
         Blocking file I/O — call from a worker thread, not the event loop.
+
+        Pass `snap` (from `snapshot()`) when this follows a `get()` in the
+        same logical operation, so a reload landing in between the two calls
+        cannot pair metadata from one generation with a body read against
+        another -- see `snapshot()` for the incident this guards against.
         """
-        meta = self.get(name)
+        meta = self.get(name, snap)
         cached = self._body_cache.get(name)
         if cached is not None and cached[0] == meta.mtime_ns and cached[1] == meta.size:
             return cached[2]
@@ -597,7 +672,12 @@ class SkillIndex:
             "generation": snap.generation,
             "indexed_at": snap.built_at,
             "bodies_cached": len(self._body_cache),
-            "roots": [str(r) for r in self.roots],
+            # Directory name only, not the full absolute mount path -- this is
+            # an MCP tool, reachable by the model, not the plain-HTTP
+            # /health, /ready, /metrics surface reserved for the operator. The
+            # full path is still in the startup log line for whoever deploys
+            # the pod.
+            "roots": [r.name for r in self.roots],
             # Non-empty means a skill on disk is not being served. Check this
             # first when "my skill isn't showing up".
             "rejected": self._rejected,
