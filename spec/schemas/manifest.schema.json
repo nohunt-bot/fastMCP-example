@@ -20,7 +20,8 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1, "maxLength": 64 },
       "uniqueItems": true,
-      "description": "RFC-039。Server 透傳但不強制執行——它不擁有 Client 的工具清單。"
+      "maxItems": 64,
+      "description": "RFC-039。Server 透傳但不強制執行——它不擁有 Client 的工具清單。RFC-113：陣列 MUST 宣告 maxItems。"
     },
     "execution": { "$ref": "#/$defs/execution" }
   },

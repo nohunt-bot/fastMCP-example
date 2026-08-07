@@ -51,7 +51,7 @@ MAX_DESCRIPTION = 1024
 FRONTMATTER_MAX_BYTES = 16 * 1024
 BODY_WARN_BYTES = 32 * 1024
 RUNNABLE_SUFFIXES = {".sh", ".py", ".js"}
-#: 由呼叫端設定會改變「執行什麼」的變數。SEC-007。
+#: 由呼叫端設定會改變「執行什麼」的變數。餵給 SEC-013 的靜態偵測。
 DANGEROUS_ENV = {
     "PATH", "SHELL", "IFS", "BASH_ENV", "ENV", "CDPATH", "GLOBIGNORE",
     "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "NODE_OPTIONS", "NODE_PATH",
@@ -395,6 +395,12 @@ def check_filesystem(directory: Path, report: Report) -> set[str]:
 #: 檔案層級的豁免標記。必須附理由——沒有理由的豁免等於關閉規則。
 SUPPRESS_RE = re.compile(r"#\s*spec:allow\s+([A-Z]+-\d{3})\s+(\S.*)$", re.M)
 
+#: RFC-057：這些 error 等級的安全規則 MUST NOT 可被豁免。豁免應該透過修改
+#: 規範本身，不是逐檔繞過——見 spec/RFC-05-驗證.md 10.5。
+NON_SUPPRESSIBLE_RULES = frozenset({
+    "SEC-001", "SEC-002", "SEC-010", "SEC-011", "SEC-012", "VAL-040",
+})
+
 
 def strip_comments(source: str, suffix: str) -> str:
     """移除註解後再做模式比對。
@@ -433,9 +439,23 @@ def check_scripts(directory: Path, scripts: set[str], report: Report) -> None:
 
         def flag(rule: str, severity: str, message: str, rfc: str, fix: str = "") -> None:
             if rule in allowed:
-                report.add(rule="LINT-030", severity="info", path=str(path),
-                           message=f"{rule} 已豁免：{allowed[rule]}", rfc=rfc)
-                return
+                if rule in NON_SUPPRESSIBLE_RULES:
+                    # RFC-057：豁免嘗試本身不能被靜默吞掉，否則作者不會知道
+                    # 為什麼 `# spec:allow` 沒有生效。先報一筆看得見的錯誤
+                    # 說明「為什麼不行」，規則本身照樣套用（往下貫穿）。
+                    report.add(
+                        rule="SEC-014", severity="error", path=str(path),
+                        message=f"{rule} 不可被豁免（RFC-057）：豁免標記已被忽略，"
+                                f"規則仍然套用。原本寫的理由：{allowed[rule]}",
+                        rfc="RFC-057",
+                        remediation=f"移除這行 # spec:allow {rule} 豁免標記，"
+                                    "修正違規本身；若確信規則本身有問題，"
+                                    "透過修改規範放寬它，而不是逐檔繞過",
+                    )
+                else:
+                    report.add(rule="LINT-030", severity="info", path=str(path),
+                               message=f"{rule} 已豁免：{allowed[rule]}", rfc=rfc)
+                    return
             report.add(rule=rule, severity=severity, path=str(path),
                        message=message, rfc=rfc, remediation=fix)
 

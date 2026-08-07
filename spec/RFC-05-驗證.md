@@ -57,6 +57,7 @@ uv run python -m spec.validate <路徑> [--recursive] [--format=json] [--level=L
 | SEC-011 | error | urlopen 缺少 timeout | 同上 | RFC-050 |
 | SEC-012 | error | curl 缺少 --max-time | 檔案層級比對 | RFC-050 |
 | SEC-013 | warning | script 覆寫 PATH 等危險變數 | 賦值比對 | RFC-052 |
+| SEC-014 | error | 嘗試豁免不可豁免的規則（RFC-057） | 豁免標記命中不可豁免清單 | RFC-057 |
 
 ### 執行期安全（無法靜態偵測，MUST 以測試驗證）
 
@@ -138,6 +139,15 @@ SEC-012、VAL-040）MUST NOT 可被豁免。
 
 **理由**：沒有理由的豁免等於關閉規則。可見的豁免可被審查；靜默的豁免不能。
 而安全規則的豁免應該透過修改規範，不是逐檔繞過。
+
+**RFC-057b** 對 RFC-057 清單中的規則寫下 `# spec:allow` MUST 不生效，
+且該次嘗試 MUST 產生一筆可見的 `SEC-014` error，點名被嘗試豁免的規則。
+
+**理由**：只讓豁免不生效還不夠——如果驗證器對嘗試本身保持沉默，畫面看起來
+會跟「作者從未寫過這行」一模一樣，作者無從得知自己的豁免被忽略、也無從
+得知原因。SEC-014 讓「規則本身」與「嘗試豁免它的動作」都留下痕跡：例如
+對 `scripts/fetch.py` 加上 `# spec:allow SEC-010 <理由>` 時，報告會同時
+包含 `SEC-014`（豁免被拒）與 `SEC-010`（原始違規仍然套用）。
 
 ## 10.6 效能驗證（PERF-0xx）
 
