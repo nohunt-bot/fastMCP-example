@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from skill_server.runner import check_arg_limits
+
 logger = logging.getLogger(__name__)
 
 #: Hooks are checks, not work. A hook that needs longer than this is doing
@@ -116,6 +118,16 @@ class HookRunner:
     async def run_pre(
         self, meta: Any, script: str, args: list[str], caller: str | None
     ) -> HookOutcome:
+        # _build_argv enforces MAX_ARGS/MAX_ARG_LEN on the caller's args, but
+        # only once the script itself is about to run -- which for a skill
+        # with hooks is *after* this payload has already been JSON-encoded
+        # and shipped to the pre-hook's stdin. Without this, a skill with
+        # hooks accepted caller args up to the 4MB stdin cap (checked only
+        # after encoding, and before the concurrency semaphore is even
+        # acquired) while a hookless skill was capped at 64 args x 4096
+        # chars from the start. Apply the same cap here, before payload
+        # construction, so both paths bound the caller identically.
+        check_arg_limits(args)
         payload = {
             "skill": meta.name,
             "script": script,

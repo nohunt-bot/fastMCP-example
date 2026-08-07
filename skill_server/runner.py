@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import resource
 import shutil
 import signal
 import sys
@@ -93,21 +94,75 @@ _NETWORK_ENV = (
 #:
 #: The SKILL_* entries are here for a different reason: they are the server's
 #: own statements about identity, and a caller must not be able to forge them.
+#:
+#: HOME and TMPDIR are in the same identity bucket, not the RCE bucket: the
+#: server means HOME to be the skill's own directory (see ``_child_env``), and
+#: a caller that overrides it can redirect wherever a library resolves its own
+#: config from (git, ssh, npm, ... all consult $HOME). TMPDIR travels with it
+#: for the same reason -- both are "where does this script think it lives",
+#: which is the server's call to make, not the caller's.
+#:
+#: The interpreters actually reachable here are python3 (-I, so most PYTHON*
+#: vars are already neutralized -- PYTHONBREAKPOINT is listed anyway as
+#: defence in depth against that flag ever being dropped), bash and sh.
+#: PS4/SHELLOPTS/BASHOPTS are the bash-specific addition: `set -x` expands PS4
+#: with command substitution on every traced line, so env={"PS4": "$(...)"} is
+#: arbitrary execution the moment a script traces itself, and SHELLOPTS/
+#: BASHOPTS are how a caller would otherwise switch tracing (or other
+#: exec-relevant options) on from the environment before the script's own
+#: `set` calls run.
 _CALLER_FORBIDDEN_ENV = frozenset({
     "PATH", "SHELL", "IFS", "BASH_ENV", "ENV", "CDPATH", "GLOBIGNORE",
+    "PS4", "SHELLOPTS", "BASHOPTS",
     "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
-    "PYTHONWARNINGS", "PYTHONINSPECT",
+    "PYTHONWARNINGS", "PYTHONINSPECT", "PYTHONBREAKPOINT",
     "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
     "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB",
     "SKILL_NAME", "SKILL_DIR", "SKILL_ROOT", "SKILL_OUTPUT_BUDGET_BYTES",
+    "HOME", "TMPDIR",
 })
 #: Any variable starting with one of these is refused: the dynamic-linker
 #: families are the classic code-injection vector (LD_PRELOAD, DYLD_INSERT_LIBRARIES).
-_CALLER_FORBIDDEN_PREFIXES = ("LD_", "DYLD_", "_RLD")
+#: BASH_FUNC_ is the Shellshock (CVE-2014-6271) vector -- bash imports a
+#: function definition from any environment variable named
+#: ``BASH_FUNC_<name>%%``, executed the moment that bash process starts, i.e.
+#: before our own script has run a single line.
+_CALLER_FORBIDDEN_PREFIXES = ("LD_", "DYLD_", "_RLD", "BASH_FUNC_")
 
 #: stdin is buffered in memory before being written to the child, so it needs a
 #: ceiling for the same reason output does.
 MAX_STDIN_BYTES = 4 * 1024 * 1024
+
+#: A caller env value cannot legitimately need more than this -- it exists so
+#: a pathological value cannot balloon the child's environment block for no
+#: functional reason. Multi-line values (a PEM cert, a JSON blob) are fine;
+#: this is just a ceiling, not a shape restriction.
+MAX_ENV_VALUE_LEN = 32 * 1024
+
+#: Control characters forbidden in a caller-supplied env *value*. NUL is the
+#: hard case: it terminates a C string, so a NUL inside a value reaches
+#: create_subprocess_exec and raises a bare ValueError that server.py does not
+#: catch -- see check_caller_env_values. Tab/newline/CR are excluded: they are
+#: ordinary bytes in a legitimate multi-line value, not a control channel.
+_FORBIDDEN_VALUE_CHARS = frozenset(chr(c) for c in range(0x20) if c not in (0x09, 0x0A, 0x0D))
+
+
+def check_arg_limits(args: Sequence[str]) -> None:
+    """Reject an argv list that is too long or contains an oversized argument.
+
+    Shared by the script path (``_build_argv``) and the hook path
+    (``hooks.py``). The hook path used to skip this entirely: it JSON-encodes
+    the same caller-supplied args into the pre-hook payload *before*
+    ``_build_argv`` ever runs, so without this check here too, a skill with
+    hooks accepted arbitrarily large args (up to the 4 MB stdin cap, applied
+    only after the JSON was already built) while a hookless skill was capped
+    at MAX_ARGS x MAX_ARG_LEN from the start.
+    """
+    if len(args) > MAX_ARGS:
+        raise ScriptError(f"too many arguments ({len(args)} > {MAX_ARGS})")
+    for arg in args:
+        if len(str(arg)) > MAX_ARG_LEN:
+            raise ScriptError(f"argument longer than {MAX_ARG_LEN} chars")
 
 
 def check_caller_env(env: dict[str, str]) -> None:
@@ -123,6 +178,29 @@ def check_caller_env(env: dict[str, str]) -> None:
                 f"environment variable {key!r} cannot be set by the caller: it changes "
                 "which program runs, not how it behaves. Pass data (tokens, URLs) "
                 "instead, or set it in the skill's own execution policy."
+            )
+
+
+def check_caller_env_values(env: dict[str, str]) -> None:
+    """Reject caller-supplied environment *values* that cannot safely reach exec().
+
+    ``check_caller_env`` only looks at names. A value containing a NUL byte
+    reaches ``create_subprocess_exec`` and raises a bare ``ValueError`` --
+    server.py catches ``(ScriptError, SkillLoadError)`` around the call into
+    the runner, so that ``ValueError`` used to crash the tool call outright
+    instead of coming back as an ordinary error result.
+    """
+    for key, value in env.items():
+        text = str(value)
+        if len(text) > MAX_ENV_VALUE_LEN:
+            raise ScriptError(
+                f"environment variable {key!r} value is {len(text):,} chars, over "
+                f"the {MAX_ENV_VALUE_LEN:,} limit"
+            )
+        if any(ch in _FORBIDDEN_VALUE_CHARS for ch in text):
+            raise ScriptError(
+                f"environment variable {key!r} contains a control character "
+                "(e.g. NUL), which is not valid in a subprocess environment"
             )
 
 
@@ -235,6 +313,109 @@ async def _pump(
                 logger.debug("on_output callback failed", exc_info=True)
 
 
+async def _feed_stdin(proc: asyncio.subprocess.Process, data: bytes) -> None:
+    """Write caller stdin to the child, as a task the deadline loop supervises.
+
+    This used to be a plain sequential ``write()`` + ``await drain()`` before
+    the deadline loop even started. Past the ~64KiB pipe buffer, ``drain()``
+    does not return until the child actually reads the data -- and most
+    shipped skills never read stdin at all, since there is no reason for a
+    script to expect it unless its own docs say so. So a large stdin payload
+    sent to a script that ignores it used to block here regardless of
+    ``timeout``, and once the child eventually exited, the broken write end
+    raised ``BrokenPipeError`` straight out of ``run()`` -- a bare ``OSError``
+    that server.py never catches, discarding whatever output had already been
+    captured in the process.
+
+    Running this as a supervised task fixes the sequencing; this function's
+    job is to make sure the failure modes are sane on their own terms too:
+
+    * A child that never reads stdin is not a bug in the child -- it is not
+      an error, and the run must be judged on the child's own exit status and
+      captured output, nothing else. BrokenPipeError/ConnectionResetError
+      while writing are exactly that case and are swallowed here.
+    * Anything else (a genuinely unexpected OSError) is re-raised as
+      ScriptError -- the type server.py already catches around the call into
+      the runner -- so it can never again escape as a bare OSError.
+    """
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(data)
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    except OSError as exc:
+        raise ScriptError(f"failed writing stdin to the child: {exc}") from exc
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+
+def _build_preexec_fn(
+    max_address_space_bytes: int | None,
+    max_child_processes: int | None,
+    max_file_size_bytes: int | None,
+    max_cpu_seconds: int | None,
+) -> Callable[[], None] | None:
+    """Build the ``preexec_fn`` that caps the child's resources, or ``None``
+    if every limit is disabled (all four ``None``).
+
+    Why ``preexec_fn`` at all: it is the only in-process way to apply
+    ``setrlimit`` to a child before it execs. The alternative -- shelling out
+    to a wrapper like ``prlimit`` -- is an extra interpreter spawn on every
+    single call, which is not acceptable at 0.5 CPU.
+
+    Why that is risky, and how this contains the risk: ``preexec_fn`` runs
+    after ``fork()``, in a copy of a process that has other threads (this
+    server uses ``asyncio.to_thread`` elsewhere). Only the one thread that
+    called ``fork()`` exists in the child; if any other thread held a lock
+    at the moment of the fork -- the allocator arena lock, the import lock,
+    the logging module's lock -- that lock is never released in the child,
+    and anything in ``preexec_fn`` that needs it (an allocation, an import, a
+    ``print``/``logger`` call, even an f-string building a new str object)
+    can hang the child forever, silently, in a way that will not reproduce
+    locally. So the function returned below calls ``resource.setrlimit`` and
+    nothing else: no logging, no allocation beyond what the call itself
+    needs, no f-strings. Do not add a print() here "just for debugging" --
+    that is exactly the kind of change that turns an occasional flaky
+    deadlock into a permanent one.
+
+    Why per-limit try/except: RLIMIT_AS and RLIMIT_NPROC are Linux-only in
+    practice -- macOS's kernel refuses to set RLIMIT_AS at all (raises
+    ValueError even for generous values) and treats RLIMIT_NPROC as a
+    per-user rather than per-process budget. A script must still run on a
+    developer's laptop, so each limit is independent and best-effort: one
+    platform refusing one limit must not stop the others from applying, and
+    must never stop the child from running.
+    """
+    limits: list[tuple[int, int]] = []
+    if max_address_space_bytes is not None:
+        limits.append((resource.RLIMIT_AS, max_address_space_bytes))
+    if max_child_processes is not None:
+        limits.append((resource.RLIMIT_NPROC, max_child_processes))
+    if max_file_size_bytes is not None:
+        limits.append((resource.RLIMIT_FSIZE, max_file_size_bytes))
+    if max_cpu_seconds is not None:
+        limits.append((resource.RLIMIT_CPU, max_cpu_seconds))
+    if not limits:
+        return None
+
+    def _preexec() -> None:
+        # ASYNC-SIGNAL-SAFE ZONE -- see the docstring above. setrlimit calls
+        # only. `limits` is already built; nothing here allocates beyond what
+        # the loop and the call itself need, and nothing here can block on a
+        # lock this (single-threaded, post-fork) process does not hold.
+        for res, value in limits:
+            try:
+                resource.setrlimit(res, (value, value))
+            except (OSError, ValueError):
+                pass
+
+    return _preexec
+
+
 class ScriptRunner:
     """Runs skill-bundled scripts with bounded concurrency."""
 
@@ -249,6 +430,42 @@ class ScriptRunner:
         output_cap_bytes: int = 256 * 1024,
         output_budget_bytes: int | None = None,
         pass_network_env: bool = True,
+        # Resource limits applied to every child via preexec_fn (see
+        # _build_preexec_fn). None disables that specific limit. Defaults are
+        # sized for a 0.5 CPU / 512Mi pod running several scripts at once --
+        # generous enough for real work, tight enough that one runaway script
+        # cannot OOM-kill the whole pod instead of just failing its own call.
+        #
+        # RLIMIT_NPROC note: this is a per-*user*, not per-process, budget --
+        # it counts every process (and on Linux, every thread) owned by the
+        # server's UID, system-wide, not just this call's descendants. A
+        # freshly started k8s pod's UID owns almost nothing else, so a modest
+        # cap is a real, tight guard there. A shared dev machine or CI runner
+        # can easily have several hundred processes under one UID already
+        # (this repo's own test suite fails under a cap of 64 on an ordinary
+        # laptop, for exactly that reason: every git subprocess the
+        # repo-digest skill shells out to needs to fork, and so does the
+        # test's own `subprocess.Popen` grandchild), and a script that
+        # legitimately forks a handful of helpers (git, a grandchild it
+        # deliberately detaches) needs headroom above whatever the box's
+        # ambient count is, not above zero. So this default trades tightness
+        # for portability: it still turns an unbounded fork bomb into a
+        # bounded one instead of a pod-wide OOM, but it is not a tight cap on
+        # a shared host. Set it low deliberately (with max_concurrency and
+        # the host's typical ambient process count in mind) if the runtime
+        # environment is a dedicated, freshly started container.
+        max_address_space_bytes: int | None = 1024 * 1024 * 1024,  # 1 GiB
+        max_child_processes: int | None = 4096,
+        # 0, not None: scripts have no legitimate reason to write a file in
+        # this deployment (read-only root filesystem, no writable volume
+        # handed to them), so this enforces "the server writes nothing" at
+        # the kernel level instead of by convention. Verified against every
+        # shipped skill under skills/ before picking 0 -- none of them write.
+        max_file_size_bytes: int | None = 0,
+        # None here means "derive from max_timeout" (see below), not
+        # "disabled" -- unlike the other three, its sane default depends on a
+        # sibling argument, so it cannot be a plain literal.
+        max_cpu_seconds: int | None = None,
     ):
         self.index = index
         self.default_timeout = default_timeout
@@ -266,6 +483,26 @@ class ScriptRunner:
         self.timeouts = 0
         self.stalls = 0
         self._in_flight = 0
+
+        self.max_address_space_bytes = max_address_space_bytes
+        self.max_child_processes = max_child_processes
+        self.max_file_size_bytes = max_file_size_bytes
+        # RLIMIT_CPU is a second line of defence behind the wall-clock
+        # timeout (it catches a busy-loop that is somehow deaf to SIGKILL's
+        # process-group delivery) so it must never be the *first* thing to
+        # fire for a call that is legitimately using the full timeout budget.
+        # Deriving it from max_timeout keeps that true even if an operator
+        # raises max_timeout without knowing this value exists; +30 is slack
+        # for CPU accounting granularity, not a meaningful policy choice.
+        self.max_cpu_seconds = (
+            max_cpu_seconds if max_cpu_seconds is not None else int(max_timeout) + 30
+        )
+        self._preexec_fn = _build_preexec_fn(
+            self.max_address_space_bytes,
+            self.max_child_processes,
+            self.max_file_size_bytes,
+            self.max_cpu_seconds,
+        )
 
     @property
     def in_flight(self) -> int:
@@ -311,14 +548,10 @@ class ScriptRunner:
                 f"allowed: {', '.join(sorted(INTERPRETERS))}"
             )
 
-        if len(args) > MAX_ARGS:
-            raise ScriptError(f"too many arguments ({len(args)} > {MAX_ARGS})")
+        check_arg_limits(args)
         argv = [*interpreter, str(target)]
         for arg in args:
-            text = str(arg)
-            if len(text) > MAX_ARG_LEN:
-                raise ScriptError(f"argument longer than {MAX_ARG_LEN} chars")
-            argv.append(text)
+            argv.append(str(arg))
         return argv, target
 
     async def run(
@@ -403,6 +636,14 @@ class ScriptRunner:
         interpreter = INTERPRETERS.get(resolved.suffix)
         if interpreter is None:
             raise ScriptError(f"no interpreter for hook {resolved.name}")
+        # Same clamp as run(): "no caller can exceed max_timeout" is an
+        # invariant of the runner, not a convention its one call site has to
+        # remember. Today HOOK_TIMEOUT (10.0) is hardcoded and well under any
+        # sane max_timeout, so this is a no-op in practice -- it is here so
+        # that stays true if that ever changes.
+        limit = min(timeout, self.max_timeout)
+        if limit <= 0:
+            raise ScriptError("timeout must be positive")
         return await self._execute(
             [*interpreter, str(resolved)],
             cwd=cwd,
@@ -410,7 +651,7 @@ class ScriptRunner:
             script_label=label,
             skill_root=None,
             stdin=stdin,
-            timeout=timeout,
+            timeout=limit,
             stall_timeout=stall_timeout,
             env=None,
             on_output=None,
@@ -447,6 +688,11 @@ class ScriptRunner:
                 if not key.replace("_", "").isalnum():
                     raise ScriptError(f"invalid environment variable name {key!r}")
             check_caller_env(env)
+            # Names were checked above; values were not -- a NUL byte in a
+            # value reaches create_subprocess_exec and raises a bare
+            # ValueError that server.py does not catch. Reject it here, as a
+            # ScriptError, before it gets anywhere near exec().
+            check_caller_env_values(env)
             child_env.update({k: str(v) for k, v in env.items()})
 
         if stdin is not None and len(stdin.encode()) > MAX_STDIN_BYTES:
@@ -476,6 +722,7 @@ class ScriptRunner:
                     cwd=str(meta_directory),
                     env=child_env,
                     start_new_session=True,  # own process group, so we can kill the tree
+                    preexec_fn=self._preexec_fn,  # RLIMIT_* -- see _build_preexec_fn
                 )
 
                 pumps = [
@@ -486,12 +733,18 @@ class ScriptRunner:
                 timed_out = stalled = False
                 deadline = started + limit
 
-                try:
-                    if stdin is not None and proc.stdin is not None:
-                        proc.stdin.write(stdin.encode())
-                        await proc.stdin.drain()
-                        proc.stdin.close()
+                # The stdin write runs as a task the deadline loop below
+                # supervises, not as a sequential await before it starts. Past
+                # the ~64KiB pipe buffer, drain() does not return until the
+                # child reads it -- and most shipped skills never touch
+                # stdin, so writing a large payload to one of them used to
+                # block here until the child exited on its own, timeout be
+                # damned (a 2s timeout measured a 60s overrun in practice).
+                stdin_task: asyncio.Task[None] | None = None
+                if stdin is not None and proc.stdin is not None:
+                    stdin_task = asyncio.create_task(_feed_stdin(proc, stdin.encode()))
 
+                try:
                     while True:
                         now = time.monotonic()
                         slices = [deadline - now]
@@ -507,8 +760,26 @@ class ScriptRunner:
                                 stalled = True
                             break
 
-                        done, _ = await asyncio.wait({waiter}, timeout=nap)
-                        if done:
+                        waitset = {waiter}
+                        if stdin_task is not None and not stdin_task.done():
+                            waitset.add(stdin_task)
+                        done, _ = await asyncio.wait(waitset, timeout=nap)
+
+                        if stdin_task in done:
+                            # The write finished (or failed) -- on its own that
+                            # is not a verdict, the child may well still be
+                            # running. A broken pipe was already swallowed
+                            # inside _feed_stdin (that is the normal case: a
+                            # child that never reads stdin). Anything else
+                            # stored on the task is a genuinely unexpected
+                            # OSError that _feed_stdin re-raised as
+                            # ScriptError; surface it the same way a build_argv
+                            # failure would be surfaced.
+                            exc = stdin_task.exception()
+                            if exc is not None:
+                                raise exc
+                            done = done - {stdin_task}
+                        if waiter in done:
                             break
                 finally:
                     if proc.returncode is None:
@@ -528,9 +799,14 @@ class ScriptRunner:
                     # So the wait is capped by whatever budget is left, with a small
                     # floor to let already-buffered output drain.
                     grace = max(0.25, min(2.0, deadline - time.monotonic()))
-                    await asyncio.wait(pumps, timeout=grace)
+                    drain_targets = list(pumps)
+                    if stdin_task is not None and not stdin_task.done():
+                        drain_targets.append(stdin_task)
+                    await asyncio.wait(drain_targets, timeout=grace)
                     for pump in pumps:
                         pump.cancel()
+                    if stdin_task is not None:
+                        stdin_task.cancel()
 
             finally:
                 self._in_flight -= 1
@@ -617,4 +893,10 @@ class ScriptRunner:
             "slots_available": self._semaphore._value,  # noqa: SLF001 - diagnostics only
             "interpreters": sorted(INTERPRETERS),
             "network_env_forwarded": self.pass_network_env,
+            "resource_limits": {
+                "max_address_space_bytes": self.max_address_space_bytes,
+                "max_child_processes": self.max_child_processes,
+                "max_file_size_bytes": self.max_file_size_bytes,
+                "max_cpu_seconds": self.max_cpu_seconds,
+            },
         }
