@@ -64,7 +64,9 @@ extent       = from matched heading , until heading of same-or-higher level ;
 | `allowed_tools` | 有宣告時 |
 
 **RFC-066** Card 的總和 MUST 受 Context Budget 約束。超過時 Server MUST
-截斷並在回應中明確標示被省略的數量與縮小範圍的方法。
+以下列兩種檢視之一回應——**逐筆截斷**（`list`）或**領域總覽**
+（`overview`）；哪一種適用、各自的形狀，見 7.3.2。無論哪一種，回應 MUST
+明確標示被省略的數量（或範圍）與縮小範圍的方法。
 
 **理由（PERF-001）**：500 個 Skill 的完整目錄實測約 23,467 tokens，佔
 30 K context 的 **78%**——在使用者說任何話之前。套用預算後降至 2,646 tokens
@@ -139,15 +141,25 @@ lower     = "a".."z" ;
 ```json
 {
   "type": "object",
-  "required": ["count", "total", "skills"],
+  "required": ["count", "total", "view", "skills"],
   "properties": {
     "count": { "type": "integer" },
     "total": { "type": "integer", "description": "索引中的總數，可能大於 count" },
+    "view": { "enum": ["list", "overview"], "description": "RFC-066，見 7.3.2" },
     "skills": { "type": "array" },
     "truncated": {
       "type": "object",
       "required": ["omitted", "hint"],
-      "description": "RFC-066。被預算裁掉時必須存在。"
+      "description": "RFC-066a。僅 view=list 時可能出現：因預算被逐筆裁掉時必須存在。"
+    },
+    "facets": {
+      "type": "object",
+      "additionalProperties": { "type": "integer" },
+      "description": "RFC-066b。僅 view=overview 時存在：領域 -> 該領域的 Skill 數。"
+    },
+    "hint": {
+      "type": "string",
+      "description": "RFC-066b。僅 view=overview 時存在：如何用 tags/query 縮小到單一領域。"
     }
   }
 }
@@ -156,6 +168,84 @@ lower     = "a".."z" ;
 **RFC-073** `total` MUST 反映索引中的真實總數，即使 `skills` 被裁切。
 
 **理由**：模型必須能分辨「只有 3 個 Skill」與「有 300 個但只看得到 3 個」。
+
+#### 7.3.1 檢索：切詞與排序
+
+`query` 不是子字串比對，而是排序過的檢索。這件事本身是規範性的
+（RFC-099a），因為中文沒有空白分詞，樸素的 `str.split()` + 子字串比對對
+中文近乎失效——實測 13 個真實中文查詢只命中 1 個（**8%**），詳見
+[附錄 A](A-事故紀錄.md) 事故 A-14。
+
+**RFC-099a** `query` 的比對 MUST 對中日韓文字（CJK）使用**至少 bigram**
+粒度的切詞，MUST NOT 只用空白分詞或全字串子字串比對。
+
+**理由**：中文詞之間沒有空白，「查訂單」不是「查詢內部訂單系統的狀態與
+明細」的子字串；bigram（把連續兩個字元當一個 token）是在不引入詞典型
+分詞器（啟動成本高，見 RFC-004）的前提下，能同時捕捉「訂單」≠「單訂」
+詞序資訊的最小方案。
+
+**RFC-099b** 除了 bigram，切詞 SHOULD 額外保留 CJK **unigram**
+（單一字元），且其權重 SHOULD 低於 bigram。拉丁字母／數字／底線構成的
+詞 SHOULD 以詞為單位切分（不套用 CJK 規則）。
+
+**理由**：unigram 補救 bigram 抓不到的情況——詞序顛倒（「貨到」查不到
+「到貨」）與單字查詢（查「貨」）。純 bigram 對長度 1 的 CJK 輸入完全沒有
+token 可切，會直接查無結果。
+
+**RFC-099c** 排序 SHOULD 使用具 IDF（逆文件頻率）特性的演算法，讓到處
+出現的字（「的」「與」）自然趨近零權重，而不需要維護一份停用詞清單。
+
+**RFC-099d** 欄位比對 SHOULD 依可信度加權：`name` 命中的可信度 SHOULD
+高於 `tags`，`tags` SHOULD 高於 `description`。
+
+**MUST 與 SHOULD 的分界**：RFC-099a（CJK 至少 bigram）是 MUST，因為它
+決定「查不查得到」——不遵守的實作會重演 A-14 的 8% 命中率，這是
+Progressive Disclosure 第 1 層直接失效。RFC-099b–d 是排序品質的調校，
+只影響「先看到誰」，不影響「找不找得到」，因此是 SHOULD：不同實作 MAY
+採用不同的 IDF 公式或欄位權重，只要不退化成純子字串比對。
+
+參考實作的實際參數（供互通參考，數值本身不是規範）：
+
+| 項目 | 值 | 說明 |
+|---|---|---|
+| 排序演算法 | BM25 | `k1=1.2`（詞頻飽和）、`b=0.5`（長度正規化，偏低——文件是 name+description+tags，長 description 不該只因字多被懲罰） |
+| unigram 權重 | `0.3` | 相對 bigram 的權重 `1.0` |
+| 欄位權重 | `name=3.0`、`tags=2.0`、`description=1.0` | 名稱命中最可信 |
+
+**參考實作與 LINT-040 的一致性**：`spec/validate.py` 的 `LINT-040`（可
+區分性檢查）使用與此處相同的 bigram 切詞比較兩個 `description` 的
+Jaccard 相似度，這樣量到的相似度才是模型在 `list_skills` 實際會遇到的
+混淆程度（見 RFC-05 §10.4）。
+
+### 7.3.2 `list` 與 `overview`：兩種合法的檢視
+
+`list_skills` 的完整目錄可能放不進 Context Budget。直接按名稱字母序
+截斷會讓排在後面的整個領域對模型隱形——實測 315 個 Skill、11 個領域時，
+模型只看得到前 6 個領域，另外 5 個完全不知道存在，而且**沒有辦法發現
+自己漏了什麼**（見附錄 A-10）。因此規範定義兩種回應形狀，依情境擇一。
+
+**RFC-066a** `view` MUST 依下表擇一，MUST NOT 依呼叫順序或其他狀態改變
+同一個請求的結果：
+
+| `view` | 何時 | `skills` 的內容 |
+|---|---|---|
+| `list` | 有 `query` 或 `tags`；或未篩選但**完整目錄**在預算內 | 逐筆 Card |
+| `overview` | 未帶 `query` 也未帶 `tags`，且**完整目錄**超過預算 | 每個領域最多若干筆代表 Card |
+
+**RFC-066b** `view=list` 因預算捨棄任何 Card 時，回應 MUST 包含
+`truncated: {omitted, hint}`。
+
+**RFC-066c** `view=overview` 時，回應 MUST 包含：
+
+| 欄位 | 內容 | 約束 |
+|---|---|---|
+| `facets` | 領域 → 該領域的 Skill 數 | MUST 涵蓋**所有**領域，MUST NOT 只列前 N 個 |
+| `skills` | 每個領域的代表樣本 | 數量 MAY 受預算限制，但涵蓋的**領域**不受限 |
+| `hint` | 如何用 `tags`／`query` 取得單一領域的完整清單 | MUST 可行動 |
+
+**理由**：`overview` 用跟 `list` 差不多的 token 數換取「涵蓋所有領域」而
+非「涵蓋所有 Skill」——模型至少要能知道**有什麼**，再自己決定要鑽進
+哪個領域，而不是連領域存在都不知道。
 
 ### 7.4 `run_skill_script`
 

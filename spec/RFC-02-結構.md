@@ -149,6 +149,108 @@ skills/finance/reconciliation/SKILL.md
 
 ---
 
+### 3.5 Hook 通訊協定
+
+3.2.4 定義了 `hooks/` 的**位置**與**威脅**（symlink 逃逸）。本節定義它的
+**輸入輸出契約**——沒有這份契約，其他團隊無法獨立實作出行為一致的
+`pre.*` / `post.*`。Hook 是一支與 Script 同等待遇的可執行檔（直譯器
+白名單、curated 環境、逾時），差別只在於它何時被呼叫、以及它說的話
+Server 會如何處理。
+
+#### 3.5.1 呼叫時機
+
+| Hook | 呼叫時機 | 可以做什麼 |
+|---|---|---|
+| `pre.*` | Script 執行**之前** | 放行 / 拒絕 / 附加環境變數 / 覆寫參數 |
+| `post.*` | Script 執行**之後** | 放行結果 / 拒絕整通呼叫 / 取代結果 |
+
+**RFC-047** Hook MUST 以 JSON 讀取 stdin。`pre` 收到：
+
+```json
+{ "skill": "<name>", "script": "scripts/x.sh", "args": ["..."],
+  "caller": "<caller id 或 null>", "skill_dir": "<絕對路徑>" }
+```
+
+`post` 收到相同欄位，MUST NOT 含 `caller`，MUST 另外附加 `result`
+（即將回給呼叫端的 `script-result.schema.json` 物件）：
+
+```json
+{ "skill": "<name>", "script": "scripts/x.sh", "args": ["..."],
+  "skill_dir": "<絕對路徑>", "result": { "status": "ok", "...": "..." } }
+```
+
+**理由**：JSON over stdio 讓 Hook 可以用任何直譯器白名單內的語言寫，不需要
+連結任何 Server 的函式庫。
+
+#### 3.5.2 離開碼即決策
+
+**RFC-048** Hook 的離開碼 MUST 是唯一的允許／拒絕依據：
+
+| 離開碼 | `pre` 的意義 | `post` 的意義 |
+|---|---|---|
+| `0` | 允許 Script 執行 | 放行（可能已修改的）結果 |
+| 非 `0` | 拒絕，Script MUST NOT 執行 | 拒絕整通呼叫 |
+
+**RFC-048a** 拒絕時的原因 MUST 依序取自：stdout 的 `{"reason": "..."}`、
+否則 stderr、否則 stdout 原文；MUST 截斷至合理長度（參考實作：500 字元）
+再回給呼叫端。
+
+**理由**：離開碼不能表達「為什麼」，而 RFC-105 要求錯誤訊息說明原因。
+
+#### 3.5.3 決策輸出
+
+允許時（離開碼 `0`），Hook MAY 在 stdout 印出一個 JSON 物件表達額外決策；
+不印，或印出非 JSON／非物件，Server MUST 視為「允許，且不修改」，MUST NOT
+視為錯誤（進度訊息、除錯輸出都應該被安靜地忽略）。
+
+**RFC-049** `pre` 的 JSON 物件可包含：
+
+| 鍵 | 型別 | 效果 |
+|---|---|---|
+| `env` | object | 併入 Script 的執行環境（多個 Hook 依鏈疊加） |
+| `args` | array | 取代呼叫端原本傳入的 `args`；後續 Hook 看到取代後的版本 |
+| `note` | string | 附加到回應的 `hook_notes`，不影響執行 |
+
+**RFC-049a** `post` 的 JSON 物件可包含：
+
+| 鍵 | 型別 | 效果 |
+|---|---|---|
+| `result` | object | 取代目前的結果；未提供時 MUST 原樣傳遞前一個結果 |
+
+**理由（RFC-049 的 `args` 覆寫）**：讓 Hook 能做正規化（例如把相對路徑轉絕對）
+而不需要 Script 自己重新解析一次呼叫端的輸入。
+
+#### 3.5.4 鏈與順序
+
+一次呼叫最多有兩個同階段的 Hook：Skill 自己的（`hooks/pre.*`）與全域的
+（`--hooks-dir` 下的 `pre.*`）。
+
+**RFC-049b** Hook 鏈的順序 MUST 為：
+
+| 階段 | 順序 | 理由 |
+|---|---|---|
+| `pre` | 全域先，Skill 後 | 組織政策（deny-list、稽核）應該最便宜地先擋下，不必先跑 Skill 自己的檢查 |
+| `post` | Skill 先，全域後 | 全域稽核看到的應該是 Skill 自己整形過後、最終要回給呼叫端的樣子 |
+
+**RFC-049c** 任一階段中只要有一個 Hook 拒絕，鏈 MUST 立即停止，MUST NOT
+呼叫鏈上其餘的 Hook。
+
+#### 3.5.5 隔離與逾時
+
+**RFC-049d** Hook MUST 套用與一般 Script 相同的沙箱控制（直譯器白名單、
+curated 環境、行程群組終止），MUST NOT 取得額外權限。
+
+**理由**：Hook 比 Script 更危險，不是更安全——它在**每一次**呼叫時執行，
+而 Skill 作者可能誤以為「這只是檢查」而降低戒心（見事故 A-01）。
+
+**RFC-049e** Hook MUST 有獨立於 Script 的逾時上限，且 SHOULD 遠短於一般
+Script 的上限。
+
+**理由**：Hook 是關卡，不是工作——需要超過幾秒的 Hook，代表它在做不該在
+關卡裡做的事。參考實作採用 10 秒定值。
+
+---
+
 ## 4. Manifest RFC
 
 Manifest 是 `SKILL.md` 開頭以 `---` 圍住的 YAML。

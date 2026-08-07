@@ -21,7 +21,8 @@
     "semver": {
       "type": "string",
       "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
-      "description": "LINT-001。Semantic Versioning 2.0.0。"
+      "maxLength": 256,
+      "description": "LINT-001。Semantic Versioning 2.0.0。RFC-110：字串型別 MUST 宣告 maxLength——pattern 已隱含地限制形狀，但沒有上限本身仍是無界輸入。256 遠超過任何實務上的 pre-release/build metadata 組合。"
     },
     "tag": {
       "type": "string",
@@ -31,12 +32,14 @@
     "scriptPath": {
       "type": "string",
       "pattern": "^scripts/[A-Za-z0-9_.-]+\\.(sh|py|js)$",
-      "description": "RFC-022 + RFC-023。只有 scripts/ 下、白名單副檔名的檔案可執行。"
+      "maxLength": 255,
+      "description": "RFC-022 + RFC-023。只有 scripts/ 下、白名單副檔名的檔案可執行。RFC-110：maxLength 255 對齊常見檔案系統單一路徑元件的上限。"
     },
     "relativePath": {
       "type": "string",
       "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$",
-      "description": "RFC-028。相對路徑，不得含 .. 或以 / 開頭。"
+      "maxLength": 1024,
+      "description": "RFC-028。相對路徑，不得含 .. 或以 / 開頭。RFC-110：maxLength 1024，與 description 的上限同量級，容許比 scriptPath 更深的巢狀（references/ 底下可能有子目錄）。"
     },
     "timeoutSeconds": {
       "type": "number",
