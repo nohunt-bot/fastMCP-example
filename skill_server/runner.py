@@ -454,7 +454,28 @@ class ScriptRunner:
         # a shared host. Set it low deliberately (with max_concurrency and
         # the host's typical ambient process count in mind) if the runtime
         # environment is a dedicated, freshly started container.
-        max_address_space_bytes: int | None = 1024 * 1024 * 1024,  # 1 GiB
+        # RLIMIT_AS caps *virtual* address space, not resident memory, and the
+        # gap between the two is large: a bare CPython process on Linux
+        # x86-64 maps a few hundred MB of VSZ before running a line of user
+        # code (glibc reserves a 64 MB malloc arena per thread, plus the
+        # shared libraries). So this cannot be set to "the memory a script
+        # ought to need" -- at 192 MiB the interpreter would fail to start at
+        # all, and the failure would be invisible during development because
+        # macOS refuses to set RLIMIT_AS and silently skips it.
+        #
+        # 512 MiB is therefore a blast-radius bound, not a memory quota. What
+        # it buys: `x = [0] * 10**9` wants ~8 GB and now dies as one failed
+        # call instead of an OOM-kill that takes the server down with it.
+        # What it does NOT buy: precise per-script accounting. Two concurrent
+        # scripts can each sit under 512 MiB and still push a 512Mi pod into
+        # OOM, so the pod's own memory limit remains the real backstop and
+        # this is the cheap guard in front of it.
+        #
+        # UNVERIFIED ON LINUX: every rlimit here was exercised on macOS,
+        # where RLIMIT_AS is not applied. Confirm a Python skill still runs
+        # under this cap on the target image before trusting it in
+        # production; lower it only with a measured VSZ figure in hand.
+        max_address_space_bytes: int | None = 512 * 1024 * 1024,
         max_child_processes: int | None = 4096,
         # 0, not None: scripts have no legitimate reason to write a file in
         # this deployment (read-only root filesystem, no writable volume

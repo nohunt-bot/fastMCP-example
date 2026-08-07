@@ -376,10 +376,39 @@ def build_server(
         scripts = list(meta.scripts)
         files = list(meta.files)
 
+        dropped_scripts = dropped_files = 0
+
+        def shape_info() -> dict[str, Any]:
+            """`output`, including the truncation notice when there is one.
+
+            This is computed inside the envelope rather than bolted on after
+            the trim loop: the notice is ~250 bytes of hint text, so adding it
+            afterwards pushed the response back over the budget it had just
+            been trimmed to fit -- the same "measure, then append something
+            unmeasured" mistake this whole block exists to fix.
+            """
+            if not (dropped_scripts or dropped_files):
+                return body_shape
+            # The model must never silently believe it has seen the full
+            # bundle -- same principle as list_skills' `truncated` field.
+            return {
+                **body_shape,
+                "shaped": True,
+                "bundle_truncated": {
+                    "scripts_omitted": dropped_scripts,
+                    "files_omitted": dropped_files,
+                    "hint": "scripts/files was cut to fit the context budget; the "
+                    "omitted entries are invisible to you. Narrow `section`, or "
+                    "call read_skill_file / run_skill_script with a path you "
+                    "already have another way, rather than assuming this list "
+                    "is complete.",
+                },
+            }
+
         def envelope() -> dict[str, Any]:
             return {
                 "name": meta.name,
-                "output": body_shape,
+                "output": shape_info(),
                 "allowed_tools": list(meta.allowed_tools),
                 "description": meta.description,
                 "version": meta.version,
@@ -392,7 +421,6 @@ def build_server(
         def size(payload: Any) -> int:
             return len(json.dumps(payload, ensure_ascii=False).encode())
 
-        dropped_scripts = dropped_files = 0
         overage = size(envelope()) - output_budget_bytes
         if overage > 0:
             # `body` alone can be tens of KB; re-serialising the *whole*
@@ -428,24 +456,6 @@ def build_server(
                 scripts.pop()
                 dropped_scripts += 1
             result = envelope()
-
-        if dropped_scripts or dropped_files:
-            # The model must never silently believe it has seen the full
-            # bundle -- same principle as list_skills' `truncated` field.
-            body_shape = {
-                **body_shape,
-                "shaped": True,
-                "bundle_truncated": {
-                    "scripts_omitted": dropped_scripts,
-                    "files_omitted": dropped_files,
-                    "hint": "scripts/files was cut to fit the context budget; the "
-                    "omitted entries are invisible to you. Narrow `section`, or "
-                    "call read_skill_file / run_skill_script with a path you "
-                    "already have another way, rather than assuming this list "
-                    "is complete.",
-                },
-            }
-            result["output"] = body_shape
 
         if ctx is not None:
             await ctx.debug(f"loaded skill {name!r} ({len(body)} chars)")
@@ -709,9 +719,28 @@ def build_server(
         including its scripts, hooks and execution policy -- never needs a
         restart.
         """
+        # force=False, deliberately. Forcing skipped the cheap mtime/size
+        # comparison, so every call re-read the frontmatter of every SKILL.md,
+        # re-walked every bundle directory and rebuilt the whole BM25 index --
+        # O(n) file reads per call. At 300 skills on a single-process asyncio
+        # server with 0.5 CPU, a caller looping this starves the event loop
+        # until the k8s probes fail: one client kills the pod without ever
+        # touching a script. The model driving this server is not adversarial,
+        # but it is a language model, and "call reload_skills until the new
+        # skill shows up" is a plausible thing for it to decide to do.
+        #
+        # A time-based throttle was the wrong answer here: it refuses
+        # legitimate work to prevent expensive work, and the legitimate case
+        # is precisely a fast write/reload/delete/reload loop during
+        # development. Letting the stamps check short-circuit instead keeps
+        # the honest call correct -- a real edit is always picked up
+        # immediately, because mtime_ns plus size is the same signal the
+        # background refresh already trusts -- while a no-op call costs one
+        # stat() per skill rather than a full rebuild. That is an ordinary
+        # read-shaped cost, not a pod-killer.
         before = index.generation
         names_before = {c["name"] for c in index.catalog(limit=1000)}
-        changed = await asyncio.to_thread(index.refresh, force=True)
+        changed = await asyncio.to_thread(index.refresh, force=False)
         names_after = {c["name"] for c in index.catalog(limit=1000)}
         return {
             "changed": changed,
