@@ -42,6 +42,7 @@ from pydantic import Field
 from starlette.responses import JSONResponse, PlainTextResponse
 
 from skill_server import shaping
+from skill_server.errors import SkillError, internal_error
 from skill_server.hooks import HookDenied, HookRunner
 from skill_server.index import SkillIndex, SkillLoadError
 from skill_server.runner import ScriptError, ScriptRunner
@@ -118,9 +119,10 @@ def _extract_section(body: str, section: str) -> str:
 
     if start is None:
         headings = [ln.strip() for ln in lines if ln.startswith("#")][:20]
-        raise ToolError(
-            f"no section matching {section!r}. Available headings: {headings}"
-        )
+        raise SkillError(
+            code="ERR-406",
+            user_message=f"沒有符合 {section!r} 的小節。可用的標題：{headings}",
+        ).as_tool_error()
     return "\n".join(lines[start:]).strip()
 
 
@@ -350,16 +352,18 @@ def build_server(
             meta = index.get(name, snap)
             body = await asyncio.to_thread(index.body, name, snap)
         except SkillLoadError as exc:
-            raise ToolError(str(exc)) from exc
+            raise SkillError(code=exc.code, user_message=str(exc)).as_tool_error() from exc
         except OSError as exc:
             # TOCTOU: the file existed at the snapshot lookup but the read in
             # index.body() lost the race (removed, permissions changed).
             # Every other error path here is sanitised (SkillLoadError never
             # carries an absolute path); a raw FileNotFoundError would break
             # that -- its message embeds the container's absolute path.
-            raise ToolError(
-                f"skill {name!r} could not be read: {exc.strerror or exc}"
-            ) from exc
+            raise SkillError(
+                code="ERR-500",
+                user_message=f"skill {name!r} 讀取失敗，請重試一次。",
+                internal_message=f"load_skill TOCTOU: {exc}",
+            ).as_tool_error() from exc
 
         if section:
             body = _extract_section(body, section)
@@ -484,7 +488,7 @@ def build_server(
         try:
             target = index.resolve_file(name, path)
         except SkillLoadError as exc:
-            raise ToolError(str(exc)) from exc
+            raise SkillError(code=exc.code, user_message=str(exc)).as_tool_error() from exc
 
         def _read() -> tuple[str, bool, int]:
             size = target.stat().st_size
@@ -499,9 +503,11 @@ def build_server(
             # vanish (or become unreadable) before this thread hop gets to
             # read it. Sanitised like every other error path here -- a raw
             # FileNotFoundError would carry the container's absolute path.
-            raise ToolError(
-                f"file for skill {name!r} could not be read: {exc.strerror or exc}"
-            ) from exc
+            raise SkillError(
+                code="ERR-500",
+                user_message=f"skill {name!r} 的檔案讀取失敗，請重試一次。",
+                internal_message=f"read_skill_file TOCTOU: {exc}",
+            ).as_tool_error() from exc
         # Same context budget as script output. A 400 KB reference file is
         # ~114k tokens: on a 30k model that is unusable, and it arrives looking
         # like a successful read rather than an error.
@@ -628,7 +634,7 @@ def build_server(
         try:
             meta = index.get(name)
         except SkillLoadError as exc:
-            raise ToolError(str(exc)) from exc
+            raise SkillError(code=exc.code, user_message=str(exc)).as_tool_error() from exc
 
         policy = meta.policy_for(script)
         argv = list(args or ())
@@ -662,9 +668,9 @@ def build_server(
                 on_output=stream if ctx is not None else None,
             )
         except HookDenied as exc:
-            raise ToolError(str(exc)) from exc
+            raise SkillError(code="ERR-403", user_message=str(exc)).as_tool_error() from exc
         except (ScriptError, SkillLoadError) as exc:
-            raise ToolError(str(exc)) from exc
+            raise SkillError(code=exc.code, user_message=str(exc)).as_tool_error() from exc
 
         if ctx is not None and result.status in ("stalled", "timeout"):
             await ctx.warning(f"{name}/{script} {result.status}: {result.hint}")
@@ -688,7 +694,9 @@ def build_server(
             try:
                 payload = await hooks.run_post(meta, script, argv, payload)
             except HookDenied as exc:
-                raise ToolError(str(exc)) from exc
+                raise SkillError(
+                    code="ERR-403", user_message=str(exc)
+                ).as_tool_error() from exc
 
         if shape_info.get("shaped") and ctx is not None:
             await ctx.info(
@@ -826,14 +834,14 @@ def build_server(
         try:
             return await asyncio.to_thread(index.body, name)
         except SkillLoadError as exc:
-            raise ToolError(str(exc)) from exc
+            raise SkillError(code=exc.code, user_message=str(exc)).as_tool_error() from exc
 
     @mcp.resource("skill://{name}/files/{path*}", mime_type="text/plain")
     async def skill_file_resource(name: str, path: str) -> str:
         try:
             target = index.resolve_file(name, path)
         except SkillLoadError as exc:
-            raise ToolError(str(exc)) from exc
+            raise SkillError(code=exc.code, user_message=str(exc)).as_tool_error() from exc
         return await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")
 
     return mcp

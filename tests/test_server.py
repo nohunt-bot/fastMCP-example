@@ -1170,10 +1170,18 @@ async def test_hook_symlinked_outside_the_bundle_is_refused(tmp_path: Path):
     from fastmcp.exceptions import ToolError
 
     async with Client(build_server([root], refresh_interval=0)) as client:
-        with pytest.raises(ToolError, match="escapes its directory"):
+        with pytest.raises(ToolError, match="resolves outside its skill directory") as caught:
             await client.call_tool(
                 "run_skill_script", {"name": "hooked", "script": "scripts/run.py"}
             )
+
+    # RFC-101: the message that reaches the caller carries no absolute path.
+    # It used to name both the jail and the resolved target, which told an
+    # attacker exactly where the bundle lives on disk and confirmed whether a
+    # probed path existed. That detail now goes to the log instead.
+    message = str(caught.value)
+    assert str(tmp_path) not in message
+    assert str(outside) not in message
 
 
 @pytest.mark.parametrize(

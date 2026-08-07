@@ -1,6 +1,8 @@
 [project]
 name = "skill-mcp"
-version = "0.1.0"
+# 0.2.0：錯誤格式從純字串改為結構化 JSON（RFC-06）。依 RFC-08 這是
+# breaking——呼叫端若解析過錯誤訊息，升級後會失效。0.x 期間以 minor 表達。
+version = "0.2.0"
 description = "High-throughput FastMCP server for progressive skill loading + sandboxed script execution"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -159,10 +159,14 @@ def check_arg_limits(args: Sequence[str]) -> None:
     at MAX_ARGS x MAX_ARG_LEN from the start.
     """
     if len(args) > MAX_ARGS:
-        raise ScriptError(f"too many arguments ({len(args)} > {MAX_ARGS})")
+        raise ScriptError(
+            f"too many arguments ({len(args)} > {MAX_ARGS})", code="ERR-412"
+        )
     for arg in args:
         if len(str(arg)) > MAX_ARG_LEN:
-            raise ScriptError(f"argument longer than {MAX_ARG_LEN} chars")
+            raise ScriptError(
+                f"argument longer than {MAX_ARG_LEN} chars", code="ERR-412"
+            )
 
 
 def check_caller_env(env: dict[str, str]) -> None:
@@ -177,7 +181,8 @@ def check_caller_env(env: dict[str, str]) -> None:
             raise ScriptError(
                 f"environment variable {key!r} cannot be set by the caller: it changes "
                 "which program runs, not how it behaves. Pass data (tokens, URLs) "
-                "instead, or set it in the skill's own execution policy."
+                "instead, or set it in the skill's own execution policy.",
+                code="ERR-410",
             )
 
 
@@ -195,17 +200,27 @@ def check_caller_env_values(env: dict[str, str]) -> None:
         if len(text) > MAX_ENV_VALUE_LEN:
             raise ScriptError(
                 f"environment variable {key!r} value is {len(text):,} chars, over "
-                f"the {MAX_ENV_VALUE_LEN:,} limit"
+                f"the {MAX_ENV_VALUE_LEN:,} limit",
+                code="ERR-410",
             )
         if any(ch in _FORBIDDEN_VALUE_CHARS for ch in text):
             raise ScriptError(
                 f"environment variable {key!r} contains a control character "
-                "(e.g. NUL), which is not valid in a subprocess environment"
+                "(e.g. NUL), which is not valid in a subprocess environment",
+                code="ERR-410",
             )
 
 
 class ScriptError(Exception):
-    """Raised when a script cannot be run (never for a non-zero exit code)."""
+    """Raised when a script cannot be run (never for a non-zero exit code).
+
+    ``code`` is the RFC-06 error code. See SkillLoadError for why it is
+    carried here rather than inferred from the message.
+    """
+
+    def __init__(self, message: str, *, code: str = "ERR-400"):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(slots=True)
@@ -345,7 +360,9 @@ async def _feed_stdin(proc: asyncio.subprocess.Process, data: bytes) -> None:
     except (BrokenPipeError, ConnectionResetError):
         pass
     except OSError as exc:
-        raise ScriptError(f"failed writing stdin to the child: {exc}") from exc
+        raise ScriptError(
+            f"failed writing stdin to the child: {exc}", code="ERR-500"
+        ) from exc
     finally:
         try:
             proc.stdin.close()
@@ -554,19 +571,21 @@ class ScriptRunner:
         try:
             target = self.index.resolve_file(skill, script)
         except SkillLoadError as exc:
-            raise ScriptError(str(exc)) from exc
+            raise ScriptError(str(exc), code=exc.code) from exc
 
         rel = target.relative_to(self.index.get(skill).directory.resolve())
         if rel.parts[0] != SCRIPTS_SUBDIR:
             raise ScriptError(
-                f"only files under {SCRIPTS_SUBDIR}/ are runnable; {script!r} is not"
+                f"only files under {SCRIPTS_SUBDIR}/ are runnable; {script!r} is not",
+                code="ERR-401",
             )
 
         interpreter = INTERPRETERS.get(target.suffix)
         if interpreter is None:
             raise ScriptError(
                 f"no interpreter registered for {target.suffix!r}; "
-                f"allowed: {', '.join(sorted(INTERPRETERS))}"
+                f"allowed: {', '.join(sorted(INTERPRETERS))}",
+                code="ERR-402",
             )
 
         check_arg_limits(args)
@@ -601,7 +620,7 @@ class ScriptRunner:
         meta = self.index.get(skill)
         limit = min(timeout or self.default_timeout, self.max_timeout)
         if limit <= 0:
-            raise ScriptError("timeout must be positive")
+            raise ScriptError("timeout must be positive", code="ERR-400")
         stall = self.default_stall_timeout if stall_timeout is None else stall_timeout
 
         return await self._execute(
@@ -651,12 +670,23 @@ class ScriptRunner:
         # are more dangerous than scripts, not less: they run on every call.
         base = Path(jail).resolve()
         if not resolved.is_relative_to(base):
-            raise ScriptError(f"hook escapes its directory ({base}): {path}")
+            # RFC-101: the caller-visible message carries no absolute path.
+            # Both `base` and `resolved` are fully-resolved container paths,
+            # and this message reaches the client -- so the useful detail goes
+            # to the log (via SkillError.internal_message at the boundary)
+            # while the caller is told only what it can act on. Naming the
+            # hook's own file is enough for that; naming where it resolved to
+            # would hand an attacker a filesystem probe.
+            raise ScriptError(
+                f"hook {path.name!r} resolves outside its skill directory and "
+                "will not be run",
+                code="ERR-401",
+            )
         if not resolved.is_file():
-            raise ScriptError(f"hook not found: {path}")
+            raise ScriptError(f"hook not found: {path}", code="ERR-405")
         interpreter = INTERPRETERS.get(resolved.suffix)
         if interpreter is None:
-            raise ScriptError(f"no interpreter for hook {resolved.name}")
+            raise ScriptError(f"no interpreter for hook {resolved.name}", code="ERR-402")
         # Same clamp as run(): "no caller can exceed max_timeout" is an
         # invariant of the runner, not a convention its one call site has to
         # remember. Today HOOK_TIMEOUT (10.0) is hardcoded and well under any
@@ -664,7 +694,7 @@ class ScriptRunner:
         # that stays true if that ever changes.
         limit = min(timeout, self.max_timeout)
         if limit <= 0:
-            raise ScriptError("timeout must be positive")
+            raise ScriptError("timeout must be positive", code="ERR-400")
         return await self._execute(
             [*interpreter, str(resolved)],
             cwd=cwd,
@@ -707,7 +737,9 @@ class ScriptRunner:
         if env:
             for key in env:
                 if not key.replace("_", "").isalnum():
-                    raise ScriptError(f"invalid environment variable name {key!r}")
+                    raise ScriptError(
+                        f"invalid environment variable name {key!r}", code="ERR-410"
+                    )
             check_caller_env(env)
             # Names were checked above; values were not -- a NUL byte in a
             # value reaches create_subprocess_exec and raises a bare
@@ -720,7 +752,8 @@ class ScriptRunner:
             raise ScriptError(
                 f"stdin is {len(stdin.encode()):,} bytes, over the "
                 f"{MAX_STDIN_BYTES:,} limit. Send it to your API in chunks, or "
-                "have the script fetch it from a URL instead of receiving it inline."
+                "have the script fetch it from a URL instead of receiving it inline.",
+                code="ERR-411",
             )
 
         state = _Capture(cap=self.output_cap_bytes)

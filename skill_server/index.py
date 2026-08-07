@@ -181,7 +181,17 @@ class _Snapshot:
 
 
 class SkillLoadError(Exception):
-    """Raised for a bad skill name or an unreadable/escaping path."""
+    """Raised for a bad skill name or an unreadable/escaping path.
+
+    ``code`` is the RFC-06 error code this maps to. It lives on the exception
+    rather than being inferred from the message at the boundary: matching on
+    message text is exactly the kind of coupling that breaks silently the
+    first time someone rewords a string.
+    """
+
+    def __init__(self, message: str, *, code: str = "ERR-404"):
+        super().__init__(message)
+        self.code = code
 
 
 class SkillRejected(Exception):
@@ -395,20 +405,30 @@ class SkillIndex:
 
     def _discover(self) -> list[tuple[Path, Path]]:
         """Find every SKILL.md under the roots (one level of nesting, plus a
-        namespace level so ``skills/<team>/<skill>/SKILL.md`` also works)."""
+        namespace level so ``skills/<team>/<skill>/SKILL.md`` also works).
+
+        Traversal is sorted by path (RFC-033). ``os.scandir`` yields entries in
+        whatever order the filesystem hands back -- inode order on ext4, near
+        enough to creation order elsewhere -- so with two skills declaring the
+        same ``name``, which one won and which one got logged as a duplicate
+        depended on the order the image happened to be built in. That made the
+        outcome differ between a developer's machine and the container, for a
+        conflict the operator never sees reported as an error. Sorting makes
+        the winner a property of the tree, not of the disk.
+        """
         found: list[tuple[Path, Path]] = []
         for root in self.roots:
             if not root.is_dir():
                 logger.warning("skill root does not exist: %s", root)
                 continue
-            for depth1 in os.scandir(root):
+            for depth1 in sorted(os.scandir(root), key=lambda e: e.name):
                 if not depth1.is_dir(follow_symlinks=True) or depth1.name.startswith("."):
                     continue
                 candidate = Path(depth1.path) / SKILL_FILE
                 if candidate.is_file():
                     found.append((candidate, root))
                     continue
-                for depth2 in os.scandir(depth1.path):
+                for depth2 in sorted(os.scandir(depth1.path), key=lambda e: e.name):
                     if not depth2.is_dir(follow_symlinks=True) or depth2.name.startswith("."):
                         continue
                     nested = Path(depth2.path) / SKILL_FILE
@@ -655,14 +675,20 @@ class SkillIndex:
         """
         meta = self.get(name)
         if not relpath or os.path.isabs(relpath):
-            raise SkillLoadError("path must be relative to the skill directory")
+            raise SkillLoadError(
+                "path must be relative to the skill directory", code="ERR-401"
+            )
 
         base = meta.directory.resolve()
         target = (base / relpath).resolve()
         if not target.is_relative_to(base):
-            raise SkillLoadError(f"path escapes the skill bundle: {relpath!r}")
+            raise SkillLoadError(
+                f"path escapes the skill bundle: {relpath!r}", code="ERR-401"
+            )
         if not target.is_file():
-            raise SkillLoadError(f"no such file in skill {name!r}: {relpath!r}")
+            raise SkillLoadError(
+                f"no such file in skill {name!r}: {relpath!r}", code="ERR-405"
+            )
         return target
 
     def stats(self) -> dict[str, Any]:

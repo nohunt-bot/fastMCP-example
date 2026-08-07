@@ -69,6 +69,8 @@
 | A-53 | Linter 只比對同一行 | `--max-time` 放在陣列變數中，被誤判為缺少 | RFC-177 |
 | A-54 | Shell 的 JSON 轉義逐行加引號 | 多行錯誤訊息變成**無效 JSON** | RFC-105 |
 | A-55 | `pipefail` 搭配 `\| head` | 上游收到 SIGPIPE，離開碼 141，但輸出正確 | LINT-021 |
+| A-56 | 驗證器容許豁免不可豁免的安全規則 | RFC-057 明訂 `error` 等級安全規則不可豁免，但 `flag()` 對所有規則一視同仁地接受 `# spec:allow`。一支 `requests.get()` 毫無 timeout 的 script 加一行註解即印出「**通過 L2**」。**條文是對的，執行條文的程式不是**，而通過的是驗證器、不是條文，所以不會有人發現 | RFC-057 |
+| A-57 | 大量 stdin 送給不讀 stdin 的 script | `drain()` 在期限迴圈**開始之前**就阻塞：`timeout=2` 實測跑滿 **60.02 秒**（30 倍），且以未捕捉的 `BrokenPipeError` 收場，連已擷取的 partial output 一併丟棄。多數 script 本來就不讀 stdin | RFC-009 / RFC-082 |
 
 ## A.7 關機
 
